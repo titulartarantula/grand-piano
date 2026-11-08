@@ -1,0 +1,21 @@
+Piano samples
+=============
+
+Salamander Grand Piano V3 (Yamaha C5), recorded by Alexander Holm
+(axeldenstore at gmail dot com). 48 kHz / 24-bit, 16 velocity layers, sampled
+in minor thirds; hammer-noise release samples (chromatic) and string-resonance
+release samples (minor thirds, three layers); sustain-pedal noises.
+
+FLAC edition "SalamanderGrandPiano-SFZ+FLAC-V3+20200602" assembled by Roberto
+(roberto@zenvoid.org) for the FreePats project:
+https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html
+
+License: Creative Commons Attribution 3.0 Unported (CC BY 3.0)
+https://creativecommons.org/licenses/by/3.0/
+
+Grand Piano does not ship the samples. It downloads the archive above on first
+launch and checks its SHA-256 before unpacking it:
+b7760e168494cf095344e217b0af013fc449ad033abbbdf1c65211cf11dc038b
+
+The samples are not modified on disk. When loading, the app trims trailing
+digital silence and normalises each sample in memory.

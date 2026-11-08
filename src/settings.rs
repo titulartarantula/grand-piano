@@ -7,6 +7,9 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioMode {
+    /// Lowest latency available: low-latency shared mode if the driver supports
+    /// small periods, otherwise exclusive mode, otherwise standard shared mode.
+    Auto,
     /// WASAPI shared mode with the smallest engine period the driver allows
     /// (IAudioClient3). Other apps keep playing sound.
     SharedLowLatency,
@@ -17,9 +20,10 @@ pub enum AudioMode {
 }
 
 impl AudioMode {
-    pub const ALL: [AudioMode; 3] = [AudioMode::SharedLowLatency, AudioMode::Exclusive, AudioMode::Shared];
+    pub const ALL: [AudioMode; 4] = [AudioMode::Auto, AudioMode::SharedLowLatency, AudioMode::Exclusive, AudioMode::Shared];
     pub fn label(self) -> &'static str {
         match self {
+            AudioMode::Auto => "Auto (lowest latency)",
             AudioMode::SharedLowLatency => "Shared, low latency",
             AudioMode::Exclusive => "Exclusive",
             AudioMode::Shared => "Shared, standard",
@@ -62,7 +66,7 @@ impl Default for Settings {
             fixed_velocity: crate::params::DEFAULT_FIXED,
             velocity_mode: VelocityMode::Light,
             audio_device: None,
-            audio_mode: AudioMode::SharedLowLatency,
+            audio_mode: AudioMode::Auto,
             buffer_frames: 128,
             midi_port: None,
             mappings: m.entries(),
