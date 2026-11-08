@@ -1,0 +1,73 @@
+[package]
+name = "grand-piano"
+version = "0.1.0"
+edition = "2024"
+description = "A simple, low-latency sampled grand piano for MIDI keyboards (Windows)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "grand_piano"
+path = "src/lib.rs"
+
+[[bin]]
+name = "GrandPiano"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+# Everything needed for the desktop app. The sampler engine, sample loader and
+# offline renderer build without it, so the tests run on any OS.
+gui = ["dep:eframe", "dep:egui", "dep:midir", "dep:windows"]
+
+[dependencies]
+anyhow = "1.0.104"
+claxon = "0.4.3"
+dirs = "7.0.0"
+flate2 = "1.1.11"
+hound = "3.5.1"
+log = "0.4.35"
+rayon = "1.12.0"
+rtrb = "0.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tar = "0.4.46"
+ureq = "3.5.1"
+env_logger = "0.11.11"
+
+eframe = { version = "0.37.0", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+egui = { version = "0.37.0", optional = true }
+midir = { version = "0.11.1", optional = true }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+optional = true
+features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Devices_Properties",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_Console",
+    "Win32_UI_Shell_PropertiesSystem",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = false
+strip = true
+
+# Keep the sampler fast in debug test runs too.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev]
+opt-level = 1
