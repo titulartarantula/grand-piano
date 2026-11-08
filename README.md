@@ -109,7 +109,7 @@ clean.
 
 ### Oxygen 49 defaults
 
-Jordan's keyboard reports USB ID `0763:3102`, "Oxygen 49". That is the
+The Oxygen 49 tested here reports USB ID `0763:3102`, "Oxygen 49". That is the
 **4th-generation Oxygen 49 (MKIV)**, whose manual is
 `Oxygen49-UserGuide-v1.3.pdf` (factory presets: VIP, Xpand!2, Velvet, Loom,
 Vacuum, Transfuser, and General MIDI on presets 7–10). These defaults assume a
@@ -151,13 +151,12 @@ The app uses its own WASAPI backend, written against the Windows API.
   runs under MMCSS "Pro Audio".
 - If the device disappears, the app retries every 2 s and falls back to the
   Windows default output.
-- **On HOLMESPC (2026-11-08):** the output is the Sony TV over NVIDIA HDMI. Its
-  driver offers only a 480-frame (10 ms) shared period, giving about 21 ms in
-  shared mode. **Auto therefore picks exclusive mode: 144 frames (3 ms) at
-  48 kHz, 24-bit, about 7 ms estimated**, with 0 late callbacks in the self-test.
-  While the app is open, other apps can't play through the TV; switch to
-  "Shared, standard" in Settings if that matters. The TV's own audio
-  processing adds latency the app can't see.
+- **Example (HDMI TV output):** a typical NVIDIA HDMI driver offers only a
+  480-frame (10 ms) shared period, giving about 21 ms in shared mode. **Auto
+  therefore picks exclusive mode: 144 frames (3 ms) at 48 kHz, 24-bit, about
+  7 ms estimated.** While the app is open, other apps can't play through that
+  device; switch to "Shared, standard" in Settings if that matters. A TV's own
+  audio processing adds latency the app can't see.
 - **ASIO:** not included. It would need Steinberg's SDK at build time.
 
 ## Files
@@ -229,3 +228,12 @@ the settings and samples.
 | `src/settings.rs`, `src/download.rs` | JSON settings, checksum-verified sample download |
 | `src/analysis.rs` | offline render and audio checks |
 | `src/audio_win.rs`, `src/midi.rs`, `src/ui.rs`, `src/main.rs` | Windows app: WASAPI, midir, egui |
+
+## License
+
+The code is released under the [MIT License](LICENSE).
+
+The piano samples are **not** part of this repository and are not covered by the
+MIT License. The app downloads the Salamander Grand Piano V3 by Alexander Holm,
+licensed under Creative Commons Attribution 3.0 (see
+`packaging/LICENSE-SAMPLES.txt`).
