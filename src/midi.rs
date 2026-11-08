@@ -4,7 +4,8 @@
 use crate::sink::EventSink;
 use grand_piano::engine::Event;
 use grand_piano::mapping::Mapper;
-use grand_piano::params::Params;
+use grand_piano::keyrange::{NoteShifter, RangeDetector};
+use grand_piano::params::{Params, bend_from_14bit, now_us};
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -79,12 +80,13 @@ impl Midi {
         let mapper = self.mapper.clone();
         let sink = self.sink.clone();
         let repaint = self.repaint.clone();
+        let mut keys = KeyState::default();
         let conn = mi
             .connect(
                 &port,
                 "grand-piano-in",
                 move |_ts, msg, _| {
-                    handle_message(msg, &params, &mapper, &sink);
+                    handle_message(msg, &params, &mapper, &sink, &mut keys);
                     if let Some(c) = &repaint {
                         c.request_repaint();
                     }
@@ -123,7 +125,15 @@ impl Midi {
     }
 }
 
-pub fn handle_message(msg: &[u8], params: &Params, mapper: &Mapper, sink: &EventSink) {
+/// Per-connection note state: the app's octave shift per held key, and the
+/// hardware range inference.
+#[derive(Default)]
+pub struct KeyState {
+    shifter: NoteShifter,
+    range: RangeDetector,
+}
+
+pub fn handle_message(msg: &[u8], params: &Params, mapper: &Mapper, sink: &EventSink, keys: &mut KeyState) {
     if msg.is_empty() {
         return;
     }
@@ -131,13 +141,33 @@ pub fn handle_message(msg: &[u8], params: &Params, mapper: &Mapper, sink: &Event
     let d1 = msg.get(1).copied().unwrap_or(0) & 0x7F;
     let d2 = msg.get(2).copied().unwrap_or(0) & 0x7F;
     match status {
-        0x90 if d2 > 0 => sink.send(Event::NoteOn { key: d1, vel: d2 }),
-        0x90 | 0x80 => sink.send(Event::NoteOff { key: d1 }),
+        0x90 if d2 > 0 => {
+            let hw = keys.range.note(d1, now_us());
+            params.hw_octave.store(hw, Ordering::Relaxed);
+            params.hw_seen.store(true, Ordering::Relaxed);
+            let (release, play) = keys.shifter.note_on(d1, params.note_shift());
+            if let Some(k) = release {
+                sink.send(Event::NoteOff { key: k });
+            }
+            if let Some(k) = play {
+                sink.send(Event::NoteOn { key: k, vel: d2 });
+            }
+        }
+        0x90 | 0x80 => {
+            if let Some(k) = keys.shifter.note_off(d1) {
+                sink.send(Event::NoteOff { key: k });
+            }
+        }
         0xB0 => {
+            if d1 == 120 || d1 == 123 {
+                keys.shifter.clear();
+            }
             if let Some(ev) = mapper.handle_cc(params, d1, d2) {
                 sink.send(ev);
             }
         }
+        // pitch bend: 14-bit, LSB first; the engine smooths it per sample
+        0xE0 => params.pitch_bend.set(bend_from_14bit(d1, d2)),
         _ => return,
     }
     params.midi_events.fetch_add(1, Ordering::Relaxed);

@@ -36,7 +36,7 @@ fn main() {
         let _ = std::fs::write(grand_piano::settings::data_dir().join("crash.txt"), format!("{info}\n{}", std::backtrace::Backtrace::force_capture()));
     }));
 
-    if has("--selftest") || has("--download-samples") || has("--render-test") || has("--help") {
+    if has("--selftest") || has("--download-samples") || has("--render-test") || has("--synth-test") || has("--help") {
         unsafe {
             let _ = windows::Win32::System::Console::AttachConsole(u32::MAX);
         }
@@ -47,8 +47,8 @@ fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Grand Piano")
-            .with_inner_size([1180.0, 660.0])
-            .with_min_inner_size([920.0, 560.0])
+            .with_inner_size([1180.0, 700.0])
+            .with_min_inner_size([960.0, 620.0])
             .with_icon(std::sync::Arc::new(ui::icon())),
         persist_window: true,
         persistence_path: Some(grand_piano::settings::config_dir().join("window.ron")),
@@ -81,7 +81,9 @@ mod cli {
         let mut o = Out { text: String::new() };
         let mut code = 0;
         if has("--help") {
-            o.line("GrandPiano.exe [--selftest] [--download-samples [--archive FILE]] [--render-test [OUT.wav]]");
+            o.line("GrandPiano.exe [--selftest] [--download-samples [--archive FILE]] [--render-test [OUT.wav]] [--synth-test]");
+            o.line("  --synth-test renders the synth presets offline and checks levels, clipping and clicks (no samples, no audio device).");
+            o.line("  --render-test also renders the Mono Synth and String Machine presets (render-<instrument>-<preset>.wav next to the log).");
             return 0;
         }
         o.line(format!("Grand Piano {} self-test", grand_piano::VERSION));
@@ -180,12 +182,34 @@ mod cli {
             }
         }
 
+        if has("--synth-test") && !has("--render-test") {
+            o.line("");
+            let (report, ok) = analysis::synth_check(48000, None);
+            for l in report.lines() {
+                o.line(l);
+            }
+            if !ok {
+                code = 5;
+            }
+        }
+
         if has("--render-test") {
+            o.line("");
+            // the synths need no samples: always check them
+            let (report, ok) = analysis::synth_check(48000, Some(&settings::data_dir()));
+            for l in report.lines() {
+                o.line(l);
+            }
+            if !ok {
+                code = 5;
+            }
             o.line("");
             match &sfz {
                 None => {
-                    o.line("render test skipped: samples not installed");
-                    code = 4;
+                    o.line("piano render test skipped: samples not installed");
+                    if code == 0 {
+                        code = 4;
+                    }
                 }
                 Some(p) => {
                     let t = std::time::Instant::now();

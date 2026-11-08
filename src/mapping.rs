@@ -2,7 +2,7 @@
 //! use it directly.
 
 use crate::engine::Event;
-use crate::params::{Params, Target, VelocityMode};
+use crate::params::{Params, Target, now_us};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicI16, AtomicU8, Ordering};
 
@@ -118,8 +118,8 @@ impl Mapper {
             self.clear_target(t);
             self.set(cc, Some(t));
             self.cancel_learn();
-            if t == Target::VelocityMode {
-                return None; // don't also switch the mode on the learning press
+            if t.is_button() {
+                return None; // don't also act on the learning press
             }
         }
         let t = self.get(cc)?;
@@ -129,14 +129,28 @@ impl Mapper {
                 params.sustain.set(v);
                 Some(Event::Sustain(v))
             }
-            Target::VelocityMode => {
-                // A button: each press (rising past the middle) steps Normal -> Light -> Fixed.
+            Target::VelocityMode
+            | Target::Instrument
+            | Target::Preset
+            | Target::MetronomeStartStop
+            | Target::TapTempo
+            | Target::OctaveDown
+            | Target::OctaveUp => {
+                // A button: each press (rising past the middle) acts once.
                 // Buttons send 127 on press and 0 on release.
                 if value == 127 && prev < 64 {
-                    params.set_mode(params.mode().next());
-                } else if value != 0 && value != 127 {
-                    // a knob/fader instead: low third = Normal, middle = Light, top = Fixed
-                    params.set_mode(VelocityMode::from_id(((v * 2.0).round()) as u8));
+                    match t {
+                        Target::VelocityMode => params.set_mode(params.mode().next()),
+                        Target::Instrument => params.set_instrument(params.instrument().next()),
+                        Target::Preset => params.next_preset(),
+                        Target::MetronomeStartStop => params.toggle_metronome(),
+                        Target::OctaveDown => params.step_octave(-1),
+                        Target::OctaveUp => params.step_octave(1),
+                        _ => params.tap(now_us()),
+                    }
+                } else if value != 0 && value != 127 && t != Target::TapTempo {
+                    // a knob/fader instead: picks a position directly
+                    params.set_target(t, v);
                 }
                 None
             }
@@ -151,6 +165,7 @@ impl Mapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::params::VelocityMode;
 
     #[test]
     fn defaults_map_oxygen_controls() {
@@ -195,6 +210,46 @@ mod tests {
         assert_eq!(p.mode(), VelocityMode::Fixed);
         m.handle_cc(&p, 113, 127);
         assert_eq!(p.mode(), VelocityMode::Normal);
+    }
+
+    #[test]
+    fn instrument_and_metronome_buttons() {
+        use crate::params::InstrumentKind;
+        let m = Mapper::with_defaults();
+        let p = Params::default();
+        m.start_learn(Target::Instrument);
+        m.handle_cc(&p, 102, 127); // learning press does nothing else
+        m.handle_cc(&p, 102, 0);
+        assert_eq!(p.instrument(), InstrumentKind::GrandPiano);
+        for want in [InstrumentKind::MonoSynth, InstrumentKind::StringMachine, InstrumentKind::GrandPiano] {
+            m.handle_cc(&p, 102, 127);
+            m.handle_cc(&p, 102, 0);
+            assert_eq!(p.instrument(), want);
+        }
+        m.set(103, Some(Target::MetronomeStartStop));
+        m.handle_cc(&p, 103, 127);
+        assert!(p.metro_running.load(Ordering::Relaxed));
+        m.handle_cc(&p, 103, 0);
+        m.handle_cc(&p, 103, 127);
+        assert!(!p.metro_running.load(Ordering::Relaxed));
+        m.set(20, Some(Target::Tempo));
+        m.handle_cc(&p, 20, 127);
+        assert_eq!(p.tempo_bpm(), 240.0);
+        m.handle_cc(&p, 20, 0);
+        assert_eq!(p.tempo_bpm(), 30.0);
+    }
+
+    #[test]
+    fn existing_mappings_still_drive_tone_and_wheel_on_synths() {
+        use crate::params::InstrumentKind;
+        let m = Mapper::with_defaults();
+        let p = Params::default();
+        p.set_instrument(InstrumentKind::MonoSynth);
+        m.handle_cc(&p, 74, 127); // Oxygen fader C1 -> Tone -> cutoff
+        m.handle_cc(&p, 1, 64); // mod wheel -> vibrato
+        assert_eq!(p.synth_cutoff[1].get(), 1.0);
+        assert!((p.vibrato.get() - 64.0 / 127.0).abs() < 1e-6);
+        assert_eq!(p.tone.get(), crate::params::DEFAULT_TONE);
     }
 
     #[test]

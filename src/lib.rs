@@ -8,11 +8,15 @@ pub mod analysis;
 pub mod download;
 pub mod dsp;
 pub mod engine;
+pub mod keyrange;
 pub mod library;
 pub mod mapping;
+pub mod metronome;
 pub mod params;
 pub mod settings;
 pub mod sfz;
+pub mod strings;
+pub mod synth;
 
 pub const APP_NAME: &str = "Grand Piano";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

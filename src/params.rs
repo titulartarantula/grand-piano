@@ -2,7 +2,9 @@
 //! Everything is lock-free (atomics), so the audio thread never blocks.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct AtomicF32(AtomicU32);
@@ -31,10 +33,29 @@ pub enum Target {
     Touch,
     Sustain,
     VelocityMode,
+    // Added with the synths and metronome. New targets go at the end so
+    // existing settings files keep their meaning.
+    /// Button: steps to the next instrument (a knob/fader picks one).
+    Instrument,
+    /// Button: steps to the next preset of the current instrument.
+    Preset,
+    /// Mono synth glide (portamento) time.
+    Glide,
+    /// Mono synth filter resonance.
+    Resonance,
+    /// Button: metronome start/stop.
+    MetronomeStartStop,
+    /// Metronome tempo, 30..240 BPM.
+    Tempo,
+    /// Button: tap tempo.
+    TapTempo,
+    /// Button: the app's octave shift down / up (-3..+3).
+    OctaveDown,
+    OctaveUp,
 }
 
 impl Target {
-    pub const ALL: [Target; 7] = [
+    pub const ALL: [Target; 16] = [
         Target::Volume,
         Target::Tone,
         Target::Reverb,
@@ -42,6 +63,15 @@ impl Target {
         Target::Touch,
         Target::Sustain,
         Target::VelocityMode,
+        Target::Instrument,
+        Target::Preset,
+        Target::Glide,
+        Target::Resonance,
+        Target::MetronomeStartStop,
+        Target::Tempo,
+        Target::TapTempo,
+        Target::OctaveDown,
+        Target::OctaveUp,
     ];
     pub fn id(self) -> u8 {
         Target::ALL.iter().position(|t| *t == self).unwrap() as u8
@@ -58,8 +88,105 @@ impl Target {
             Target::Touch => "Touch",
             Target::Sustain => "Sustain",
             Target::VelocityMode => "Velocity mode",
+            Target::Instrument => "Instrument",
+            Target::Preset => "Preset",
+            Target::Glide => "Glide",
+            Target::Resonance => "Resonance",
+            Target::MetronomeStartStop => "Metronome start/stop",
+            Target::Tempo => "Tempo",
+            Target::TapTempo => "Tap tempo",
+            Target::OctaveDown => "Octave down",
+            Target::OctaveUp => "Octave up",
         }
     }
+    /// Targets driven by a button press (127 = press) rather than a continuous value.
+    pub fn is_button(self) -> bool {
+        matches!(
+            self,
+            Target::VelocityMode | Target::Instrument | Target::Preset | Target::MetronomeStartStop | Target::TapTempo | Target::OctaveDown | Target::OctaveUp
+        )
+    }
+}
+
+/// The instruments on the main screen, in selector order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstrumentKind {
+    GrandPiano,
+    /// Real-time subtractive mono synth (3 oscillators, 24 dB ladder filter, glide).
+    MonoSynth,
+    /// Real-time divide-down string ensemble with ensemble chorus and phaser.
+    StringMachine,
+}
+
+impl InstrumentKind {
+    pub const ALL: [InstrumentKind; 3] = [InstrumentKind::GrandPiano, InstrumentKind::MonoSynth, InstrumentKind::StringMachine];
+    pub fn id(self) -> u8 {
+        match self {
+            InstrumentKind::GrandPiano => 0,
+            InstrumentKind::MonoSynth => 1,
+            InstrumentKind::StringMachine => 2,
+        }
+    }
+    pub fn from_id(id: u8) -> InstrumentKind {
+        match id {
+            1 => InstrumentKind::MonoSynth,
+            2 => InstrumentKind::StringMachine,
+            _ => InstrumentKind::GrandPiano,
+        }
+    }
+    pub fn next(self) -> InstrumentKind {
+        InstrumentKind::from_id((self.id() + 1) % 3)
+    }
+    /// Short name for the selector.
+    pub fn label(self) -> &'static str {
+        match self {
+            InstrumentKind::GrandPiano => "Grand Piano",
+            InstrumentKind::MonoSynth => "Mono Synth",
+            InstrumentKind::StringMachine => "String Machine",
+        }
+    }
+    /// Descriptive subtitle.
+    pub fn description(self) -> &'static str {
+        match self {
+            InstrumentKind::GrandPiano => "Salamander Grand · Yamaha C5",
+            InstrumentKind::MonoSynth => "Mono Synth (Moog-style) · 3 oscillators · 24 dB ladder filter",
+            InstrumentKind::StringMachine => "String Machine · late-'70s divide-down string ensemble",
+        }
+    }
+    pub fn is_synth(self) -> bool {
+        self != InstrumentKind::GrandPiano
+    }
+    pub fn presets(self) -> &'static [&'static str] {
+        match self {
+            InstrumentKind::GrandPiano => &[],
+            InstrumentKind::MonoSynth => &["Bass", "Lead", "Poly"],
+            InstrumentKind::StringMachine => &["Strings", "Phased", "Dark"],
+        }
+    }
+}
+
+pub const DEFAULT_BEND_RANGE: u8 = 2;
+pub const MAX_BEND_RANGE: u8 = 12;
+
+/// MIDI pitch-bend message data bytes (LSB, MSB) -> -1..+1. The 14-bit centre
+/// 8192 is exactly 0; 0 is -1 and 16383 is +1.
+pub fn bend_from_14bit(lsb: u8, msb: u8) -> f32 {
+    let v = ((msb as i32 & 0x7F) << 7) | (lsb as i32 & 0x7F);
+    let d = v - 8192;
+    if d < 0 { d as f32 / 8192.0 } else { d as f32 / 8191.0 }
+}
+
+pub const TEMPO_MIN: f32 = 30.0;
+pub const TEMPO_MAX: f32 = 240.0;
+pub const DEFAULT_TEMPO: f32 = 100.0;
+pub const DEFAULT_BEATS_PER_BAR: u8 = 4;
+pub const DEFAULT_CLICK_LEVEL: f32 = 0.6;
+
+/// Microseconds since the first call (a process-wide monotonic clock shared by
+/// the audio thread and the UI, used to line the beat light up with the click).
+pub fn now_us() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,18 +248,27 @@ pub fn shape_velocity(mode: VelocityMode, touch: f32, fixed: f32, vel: u8) -> u8
     out.round().clamp(1.0, 127.0) as u8
 }
 
-/// Master volume knob position (0..1) -> linear gain. 0.8 = 0 dB, 1.0 = +12 dB.
-pub fn volume_gain(pos: f32) -> f32 {
-    if pos <= 0.001 {
-        0.0
-    } else {
-        let db = -48.0 + 60.0 * pos;
-        10f32.powf(db / 20.0)
+/// Master volume taper. A smooth curve in dB, `-40 + 66p - 20p²`, through
+/// 25 % ≈ -25 dB, 50 % = -12 dB, 80 % = 0 dB (unity, the default) and 100 % =
+/// +6 dB. It gets gentler towards the top (about 0.2 dB per MIDI step at the
+/// end), so the last part of the travel no longer slams into the limiter.
+/// Below 10 % the gain also fades linearly to silence, so there is no jump to
+/// "off" at the bottom. Adjacent CC values are never more than ~1.4 dB apart
+/// above CC 10.
+pub fn volume_db(pos: f32) -> f32 {
+    if pos <= 0.0005 {
+        return f32::NEG_INFINITY;
     }
+    let p = pos.clamp(0.0, 1.0);
+    let curve = -40.0 + 66.0 * p - 20.0 * p * p;
+    let fade = if p < 0.1 { 20.0 * (p / 0.1).log10() } else { 0.0 };
+    curve + fade
 }
 
-pub fn volume_db(pos: f32) -> f32 {
-    if pos <= 0.001 { f32::NEG_INFINITY } else { -48.0 + 60.0 * pos }
+/// Master volume knob position (0..1) -> linear gain. See `volume_db`.
+pub fn volume_gain(pos: f32) -> f32 {
+    let db = volume_db(pos);
+    if db.is_infinite() { 0.0 } else { 10f32.powf(db / 20.0) }
 }
 
 pub struct Params {
@@ -145,6 +281,53 @@ pub struct Params {
     pub fixed_velocity: AtomicF32, // 1..127
     pub velocity_mode: AtomicU8,
     pub sustain: AtomicF32, // 0..1, last value received (display only; engine gets events)
+
+    // ---- instruments ----
+    pub instrument: AtomicU8,
+    /// preset index per instrument
+    pub preset: [AtomicU8; 3],
+    /// filter cutoff knob per synth instrument (index = instrument id; 0 unused)
+    pub synth_cutoff: [AtomicF32; 3],
+    /// mod wheel for the synths (vibrato depth)
+    pub vibrato: AtomicF32,
+    pub glide: AtomicF32,
+    pub resonance: AtomicF32,
+
+    // ---- pitch bend ----
+    /// the wheel, -1..+1 (0 = centre)
+    pub pitch_bend: AtomicF32,
+    /// bend range in semitones per instrument, up and down (0..12)
+    pub bend_up: [AtomicU8; 3],
+    pub bend_down: [AtomicU8; 3],
+    /// the piano ignores pitch bend unless this is on
+    pub piano_bend: AtomicBool,
+
+    // ---- octave / transpose (applied to incoming MIDI notes) ----
+    pub octave: AtomicI32,
+    pub transpose: AtomicI32,
+    /// MIDI -> UI: inferred octave shift of the hardware keyboard, and whether
+    /// any note has been played yet (until then it's the default assumption)
+    pub hw_octave: AtomicI32,
+    pub hw_seen: AtomicBool,
+
+    // ---- metronome ----
+    pub metro_running: AtomicBool,
+    /// BPM, 30..240 (rounded to whole BPM by the engine)
+    pub tempo: AtomicF32,
+    pub beats_per_bar: AtomicU8,
+    pub click_on: AtomicBool,
+    pub blink_on: AtomicBool,
+    pub click_level: AtomicF32,
+    /// last tap time (now_us) and the averaged tap interval in µs (0 = none)
+    tap_last_us: AtomicU64,
+    tap_interval_us: AtomicU64,
+    /// Audio -> UI: beat counter, beat-in-bar (0 = downbeat) and when that beat
+    /// leaves the speakers (now_us clock, output latency included).
+    pub beat_seq: AtomicU32,
+    pub beat_in_bar: AtomicU8,
+    pub beat_audible_us: AtomicU64,
+    /// UI -> audio: estimated output latency in ms, for the beat light.
+    pub output_latency_ms: AtomicF32,
 
     // ---- telemetry (audio/MIDI -> UI) ----
     pub keys_down: [AtomicU64; 2],
@@ -176,6 +359,36 @@ impl Default for Params {
             fixed_velocity: AtomicF32::new(DEFAULT_FIXED),
             velocity_mode: AtomicU8::new(VelocityMode::Light.id()),
             sustain: AtomicF32::new(0.0),
+            instrument: AtomicU8::new(0),
+            preset: Default::default(),
+            synth_cutoff: [
+                AtomicF32::new(0.5),
+                AtomicF32::new(crate::synth::MONO_PRESETS[0].cutoff),
+                AtomicF32::new(crate::strings::STRING_PRESETS[0].cutoff),
+            ],
+            vibrato: AtomicF32::new(0.0),
+            glide: AtomicF32::new(crate::synth::MONO_PRESETS[0].glide),
+            resonance: AtomicF32::new(crate::synth::MONO_PRESETS[0].resonance),
+            pitch_bend: AtomicF32::new(0.0),
+            bend_up: std::array::from_fn(|_| AtomicU8::new(DEFAULT_BEND_RANGE)),
+            bend_down: std::array::from_fn(|_| AtomicU8::new(DEFAULT_BEND_RANGE)),
+            piano_bend: AtomicBool::new(false),
+            octave: AtomicI32::new(0),
+            transpose: AtomicI32::new(0),
+            hw_octave: AtomicI32::new(0),
+            hw_seen: AtomicBool::new(false),
+            metro_running: AtomicBool::new(false),
+            tempo: AtomicF32::new(DEFAULT_TEMPO),
+            beats_per_bar: AtomicU8::new(DEFAULT_BEATS_PER_BAR),
+            click_on: AtomicBool::new(true),
+            blink_on: AtomicBool::new(true),
+            click_level: AtomicF32::new(DEFAULT_CLICK_LEVEL),
+            tap_last_us: AtomicU64::new(0),
+            tap_interval_us: AtomicU64::new(0),
+            beat_seq: AtomicU32::new(0),
+            beat_in_bar: AtomicU8::new(0),
+            beat_audible_us: AtomicU64::new(0),
+            output_latency_ms: AtomicF32::new(0.0),
             keys_down: Default::default(),
             keys_sounding: Default::default(),
             active_voices: AtomicU32::new(0),
@@ -219,28 +432,151 @@ impl Params {
         };
         shape_velocity(m, touch, self.fixed_velocity.get(), vel)
     }
-    /// Get a knob-style target's position (0..1).
+    pub fn instrument(&self) -> InstrumentKind {
+        InstrumentKind::from_id(self.instrument.load(Ordering::Relaxed))
+    }
+    pub fn set_instrument(&self, i: InstrumentKind) {
+        self.instrument.store(i.id(), Ordering::Relaxed)
+    }
+    pub fn preset_of(&self, i: InstrumentKind) -> usize {
+        let n = i.presets().len();
+        if n == 0 { 0 } else { (self.preset[i.id() as usize].load(Ordering::Relaxed) as usize).min(n - 1) }
+    }
+    /// Chooses a preset and loads its knob defaults (cutoff, and for the mono
+    /// synth resonance and glide), like recalling a patch on a hardware synth.
+    pub fn select_preset(&self, i: InstrumentKind, idx: usize) {
+        let n = i.presets().len();
+        if n == 0 {
+            return;
+        }
+        let idx = idx % n;
+        self.preset[i.id() as usize].store(idx as u8, Ordering::Relaxed);
+        match i {
+            InstrumentKind::MonoSynth => {
+                let p = &crate::synth::MONO_PRESETS[idx];
+                self.synth_cutoff[1].set(p.cutoff);
+                self.resonance.set(p.resonance);
+                self.glide.set(p.glide);
+            }
+            InstrumentKind::StringMachine => {
+                self.synth_cutoff[2].set(crate::strings::STRING_PRESETS[idx].cutoff);
+            }
+            InstrumentKind::GrandPiano => {}
+        }
+    }
+    pub fn next_preset(&self) {
+        let i = self.instrument();
+        self.select_preset(i, self.preset_of(i) + 1);
+    }
+
+    /// Current pitch bend in semitones for `inst` (0 for the piano unless allowed).
+    pub fn bend_semis(&self, inst: InstrumentKind) -> f32 {
+        if inst == InstrumentKind::GrandPiano && !self.piano_bend.load(Ordering::Relaxed) {
+            return 0.0;
+        }
+        let w = self.pitch_bend.get().clamp(-1.0, 1.0);
+        let i = inst.id() as usize;
+        if w >= 0.0 {
+            w * self.bend_up[i].load(Ordering::Relaxed).min(MAX_BEND_RANGE) as f32
+        } else {
+            w * self.bend_down[i].load(Ordering::Relaxed).min(MAX_BEND_RANGE) as f32
+        }
+    }
+
+    /// Semitones added to incoming notes: octave * 12 + transpose.
+    pub fn note_shift(&self) -> i32 {
+        self.octave.load(Ordering::Relaxed) * 12 + self.transpose.load(Ordering::Relaxed)
+    }
+    pub fn step_octave(&self, d: i32) {
+        let o = (self.octave.load(Ordering::Relaxed) + d).clamp(crate::keyrange::OCTAVE_MIN, crate::keyrange::OCTAVE_MAX);
+        self.octave.store(o, Ordering::Relaxed);
+    }
+
+    pub fn tempo_bpm(&self) -> f32 {
+        self.tempo.get().clamp(TEMPO_MIN, TEMPO_MAX)
+    }
+    pub fn set_tempo_bpm(&self, bpm: f32) {
+        self.tempo.set(bpm.round().clamp(TEMPO_MIN, TEMPO_MAX));
+    }
+    pub fn toggle_metronome(&self) {
+        self.metro_running.fetch_xor(true, Ordering::Relaxed);
+    }
+    /// Tap tempo. Taps more than 2 s apart start over; the tempo follows the
+    /// average of the recent intervals once two taps are in.
+    pub fn tap(&self, now_us: u64) {
+        let last = self.tap_last_us.load(Ordering::Relaxed);
+        let dt = now_us.saturating_sub(last);
+        if last != 0 && dt < 200_000 {
+            return; // switch bounce or a double press; faster than 300 BPM anyway
+        }
+        self.tap_last_us.store(now_us, Ordering::Relaxed);
+        if last == 0 || dt > 2_000_000 {
+            self.tap_interval_us.store(0, Ordering::Relaxed);
+            return;
+        }
+        let prev = self.tap_interval_us.load(Ordering::Relaxed);
+        // follow tempo changes quickly but smooth out jitter
+        let avg = if prev == 0 || (dt as f64 / prev as f64 - 1.0).abs() > 0.3 { dt } else { (prev * 2 + dt) / 3 };
+        self.tap_interval_us.store(avg, Ordering::Relaxed);
+        self.set_tempo_bpm(60_000_000.0 / avg as f32);
+    }
+
+    /// Get a knob-style target's position (0..1). Tone and the mod wheel follow
+    /// the current instrument: on the synths they are filter cutoff and vibrato.
     pub fn get_target(&self, t: Target) -> f32 {
+        let inst = self.instrument();
         match t {
             Target::Volume => self.volume.get(),
+            Target::Tone if inst.is_synth() => self.synth_cutoff[inst.id() as usize].get(),
             Target::Tone => self.tone.get(),
             Target::Reverb => self.reverb.get(),
+            Target::Modulation if inst.is_synth() => self.vibrato.get(),
             Target::Modulation => self.modulation.get(),
             Target::Touch => self.touch_pos(),
             Target::Sustain => self.sustain.get(),
             Target::VelocityMode => self.mode().id() as f32 / 2.0,
+            Target::Instrument => inst.id() as f32 / 2.0,
+            Target::Preset => {
+                let n = inst.presets().len();
+                if n > 1 { self.preset_of(inst) as f32 / (n - 1) as f32 } else { 0.0 }
+            }
+            Target::Glide => self.glide.get(),
+            Target::Resonance => self.resonance.get(),
+            Target::MetronomeStartStop => if self.metro_running.load(Ordering::Relaxed) { 1.0 } else { 0.0 },
+            Target::Tempo => (self.tempo_bpm() - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN),
+            Target::TapTempo => 0.0,
+            Target::OctaveDown | Target::OctaveUp => (self.octave.load(Ordering::Relaxed) + 3) as f32 / 6.0,
         }
     }
     pub fn set_target(&self, t: Target, v: f32) {
         let v = v.clamp(0.0, 1.0);
+        let inst = self.instrument();
         match t {
             Target::Volume => self.volume.set(v),
+            Target::Tone if inst.is_synth() => self.synth_cutoff[inst.id() as usize].set(v),
             Target::Tone => self.tone.set(v),
             Target::Reverb => self.reverb.set(v),
+            Target::Modulation if inst.is_synth() => self.vibrato.set(v),
             Target::Modulation => self.modulation.set(v),
             Target::Touch => self.set_touch_pos(v),
             Target::Sustain => self.sustain.set(v),
             Target::VelocityMode => self.set_mode(VelocityMode::from_id((v * 2.0).round() as u8)),
+            Target::Instrument => self.set_instrument(InstrumentKind::from_id((v * 2.0).round() as u8)),
+            Target::Preset => {
+                let n = inst.presets().len();
+                if n > 0 {
+                    let idx = (v * (n - 1) as f32).round() as usize;
+                    if idx != self.preset_of(inst) {
+                        self.select_preset(inst, idx);
+                    }
+                }
+            }
+            Target::Glide => self.glide.set(v),
+            Target::Resonance => self.resonance.set(v),
+            Target::MetronomeStartStop => self.metro_running.store(v >= 0.5, Ordering::Relaxed),
+            Target::Tempo => self.set_tempo_bpm(TEMPO_MIN + v * (TEMPO_MAX - TEMPO_MIN)),
+            Target::TapTempo => {}
+            Target::OctaveDown | Target::OctaveUp => self.octave.store((v * 6.0).round() as i32 - 3, Ordering::Relaxed),
         }
     }
     pub fn key_bit(arr: &[AtomicU64; 2], key: u8, on: bool) {
@@ -297,9 +633,101 @@ mod tests {
 
     #[test]
     fn volume_taper() {
+        // unity at the default position (saved settings keep their loudness)
         assert!((volume_gain(0.8) - 1.0).abs() < 1e-4);
-        assert!((20.0 * volume_gain(1.0).log10() - 12.0).abs() < 1e-3);
+        assert!((volume_db(1.0) - 6.0).abs() < 1e-3, "max +6 dB");
+        assert!((volume_db(0.5) + 12.0).abs() < 0.05);
+        assert!((volume_db(0.25) + 24.75).abs() < 0.05);
         assert_eq!(volume_gain(0.0), 0.0);
+        // no lurch at the bottom: the first step is already very quiet
+        assert!(volume_db(1.0 / 127.0) < -55.0);
+    }
+
+    #[test]
+    fn volume_is_monotonic_with_small_cc_steps() {
+        let mut last = -1.0f32;
+        for cc in 0..=127u32 {
+            let g = volume_gain(cc as f32 / 127.0);
+            assert!(g > last || (cc == 0 && g == 0.0), "not monotonic at CC {cc}");
+            last = g;
+            if cc > 10 {
+                let step = volume_db(cc as f32 / 127.0) - volume_db((cc - 1) as f32 / 127.0);
+                assert!(step > 0.0 && step <= 1.5, "CC {} -> {cc}: {step:.2} dB", cc - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn tone_and_wheel_follow_the_instrument() {
+        let p = Params::default();
+        p.set_target(Target::Tone, 0.3);
+        p.set_instrument(InstrumentKind::MonoSynth);
+        p.set_target(Target::Tone, 0.9);
+        p.set_target(Target::Modulation, 0.7);
+        assert!((p.tone.get() - 0.3).abs() < 1e-6, "piano tone untouched");
+        assert!((p.synth_cutoff[1].get() - 0.9).abs() < 1e-6);
+        assert!((p.vibrato.get() - 0.7).abs() < 1e-6);
+        assert_eq!(p.modulation.get(), DEFAULT_MOD, "piano shimmer untouched");
+        p.set_instrument(InstrumentKind::GrandPiano);
+        assert!((p.get_target(Target::Tone) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn presets_load_knob_defaults() {
+        let p = Params::default();
+        p.select_preset(InstrumentKind::MonoSynth, 1);
+        assert_eq!(p.preset_of(InstrumentKind::MonoSynth), 1);
+        assert_eq!(p.glide.get(), crate::synth::MONO_PRESETS[1].glide);
+        p.set_instrument(InstrumentKind::MonoSynth);
+        p.next_preset();
+        p.next_preset();
+        assert_eq!(p.preset_of(InstrumentKind::MonoSynth), 0, "wraps around");
+    }
+
+    #[test]
+    fn pitch_bend_14bit() {
+        // centre 8192 = 0x2000: LSB 0, MSB 64 -> exactly no bend
+        assert_eq!(bend_from_14bit(0, 64), 0.0);
+        assert_eq!(bend_from_14bit(0, 0), -1.0);
+        assert_eq!(bend_from_14bit(127, 127), 1.0);
+        assert!(bend_from_14bit(1, 64) > 0.0 && bend_from_14bit(127, 63) < 0.0);
+        let p = Params::default();
+        let mono = InstrumentKind::MonoSynth;
+        // default ±2
+        p.pitch_bend.set(bend_from_14bit(127, 127));
+        assert_eq!(p.bend_semis(mono), 2.0);
+        p.pitch_bend.set(bend_from_14bit(0, 0));
+        assert_eq!(p.bend_semis(mono), -2.0);
+        p.pitch_bend.set(bend_from_14bit(0, 64));
+        assert_eq!(p.bend_semis(mono), 0.0);
+        // asymmetric: up 2, down 12
+        p.bend_down[mono.id() as usize].store(12, Ordering::Relaxed);
+        p.pitch_bend.set(bend_from_14bit(0, 0));
+        assert_eq!(p.bend_semis(mono), -12.0);
+        p.pitch_bend.set(bend_from_14bit(127, 127));
+        assert_eq!(p.bend_semis(mono), 2.0);
+        // the piano ignores bend unless allowed
+        assert_eq!(p.bend_semis(InstrumentKind::GrandPiano), 0.0);
+        p.piano_bend.store(true, Ordering::Relaxed);
+        assert_eq!(p.bend_semis(InstrumentKind::GrandPiano), 2.0);
+    }
+
+    #[test]
+    fn tap_tempo() {
+        let p = Params::default();
+        let t0 = 10_000_000u64;
+        for i in 0..4 {
+            p.tap(t0 + i * 500_000); // 120 BPM
+        }
+        assert_eq!(p.tempo_bpm(), 120.0);
+        // a long pause starts over; the first new tap changes nothing
+        p.tap(t0 + 10_000_000);
+        assert_eq!(p.tempo_bpm(), 120.0);
+        p.tap(t0 + 10_750_000); // 80 BPM
+        assert_eq!(p.tempo_bpm(), 80.0);
+        // tempo is clamped
+        p.tap(t0 + 12_700_000);
+        assert!(p.tempo_bpm() >= TEMPO_MIN);
     }
 
     #[test]

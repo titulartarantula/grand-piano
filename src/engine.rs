@@ -9,9 +9,12 @@
 //! `rt_decay` for the time the note was held. Key-release noise plays on every
 //! key-up.
 
-use crate::dsp::{Limiter, Reverb, Shimmer, Smooth, Tone};
+use crate::dsp::{Limiter, Reverb, Shimmer, Smooth, Tone, soft_clip};
 use crate::library::{Instrument, NONE};
-use crate::params::{Params, volume_gain};
+use crate::metronome::{MetroControls, Metronome};
+use crate::params::{InstrumentKind, Params, now_us, volume_gain};
+use crate::strings::{StringControls, StringMachine};
+use crate::synth::{MonoControls, MonoSynth};
 use crate::sfz::RegionKind;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -111,12 +114,20 @@ pub struct Engine {
     dry: Box<[f32; BLOCK * 2]>,
     cal: f32,
     peak_hold: f32,
+    // ---- synths and metronome
+    current: InstrumentKind,
+    mono: Box<MonoSynth>,
+    strings: Box<StringMachine>,
+    synth_down: [bool; 128],
+    metro: Metronome,
+    /// piano pitch-bend playback-rate multiplier at the end of the last block
+    piano_bend_mul: f32,
 }
 
 impl Engine {
     pub fn new(inst: Arc<Instrument>, params: Arc<Params>, sample_rate: u32) -> Engine {
         let sr = sample_rate as f32;
-        Engine {
+        let mut e = Engine {
             inst,
             vol: Smooth::new(volume_gain(params.volume.get()), sr, 30.0),
             rev_amt: Smooth::new(params.reverb.get(), sr, 50.0),
@@ -138,6 +149,84 @@ impl Engine {
             dry: Box::new([0.0; BLOCK * 2]),
             cal: 10f32.powf(CALIBRATION_DB / 20.0),
             peak_hold: 0.0,
+            current: InstrumentKind::GrandPiano,
+            mono: Box::new(MonoSynth::new(sr)),
+            strings: Box::new(StringMachine::new(sr)),
+            synth_down: [false; 128],
+            metro: Metronome::new(sample_rate),
+            piano_bend_mul: 1.0,
+        };
+        e.current = e.params.instrument();
+        e.mono.set_preset(e.params.preset_of(InstrumentKind::MonoSynth));
+        e.strings.set_preset(e.params.preset_of(InstrumentKind::StringMachine));
+        e
+    }
+
+    pub fn instrument(&self) -> InstrumentKind {
+        self.current
+    }
+
+    /// Follows instrument and preset changes made by the UI or MIDI. Notes on
+    /// the old instrument are released normally (they ring out; no cut-off).
+    fn sync_instrument(&mut self) {
+        let inst = self.params.instrument();
+        if inst != self.current {
+            match self.current {
+                InstrumentKind::GrandPiano => {
+                    for k in 0..128u8 {
+                        if self.keys[k as usize].down {
+                            self.note_off(k);
+                        }
+                    }
+                }
+                _ => self.synth_release_all(),
+            }
+            self.current = inst;
+        }
+        let mp = self.params.preset_of(InstrumentKind::MonoSynth);
+        if mp != self.mono.preset() {
+            self.mono.set_preset(mp); // releases its notes
+        }
+        let sp = self.params.preset_of(InstrumentKind::StringMachine);
+        if sp != self.strings.preset() {
+            self.strings.release_all();
+            self.strings.set_preset(sp);
+        }
+    }
+
+    fn synth_release_all(&mut self) {
+        self.mono.release_all();
+        self.strings.release_all();
+        for k in 0..128u8 {
+            if self.synth_down[k as usize] {
+                self.synth_down[k as usize] = false;
+                Params::key_bit(&self.params.keys_down, k, false);
+            }
+        }
+    }
+
+    fn synth_note_on(&mut self, key: u8, raw_vel: u8) {
+        let vel = self.params.shape(raw_vel);
+        self.params.last_velocity_in.store(raw_vel, Ordering::Relaxed);
+        self.params.last_velocity_out.store(vel, Ordering::Relaxed);
+        match self.current {
+            InstrumentKind::MonoSynth => self.mono.note_on(key, vel, self.params.glide.get()),
+            InstrumentKind::StringMachine => self.strings.note_on(key, vel),
+            InstrumentKind::GrandPiano => return,
+        }
+        self.synth_down[key as usize] = true;
+        Params::key_bit(&self.params.keys_down, key, true);
+    }
+
+    fn synth_note_off(&mut self, key: u8) {
+        if !self.synth_down[key as usize] {
+            return;
+        }
+        self.synth_down[key as usize] = false;
+        self.mono.note_off(key);
+        self.strings.note_off(key);
+        if !self.keys[key as usize].down {
+            Params::key_bit(&self.params.keys_down, key, false);
         }
     }
 
@@ -155,7 +244,7 @@ impl Engine {
     }
 
     pub fn active_voices(&self) -> usize {
-        self.voices.iter().filter(|v| v.active).count()
+        self.voices.iter().filter(|v| v.active).count() + self.mono.active_voices() + self.strings.active_voices()
     }
 
     fn rand(&mut self) -> f32 {
@@ -169,18 +258,41 @@ impl Engine {
 
     /// Applies one event immediately (also used by tests and the offline renderer).
     pub fn handle(&mut self, ev: Event) {
+        if self.params.instrument() != self.current {
+            self.sync_instrument();
+        }
         match ev {
-            Event::NoteOn { key, vel } if vel > 0 => self.note_on(key, vel),
-            Event::NoteOn { key, .. } | Event::NoteOff { key } => self.note_off(key),
-            Event::Sustain(v) => self.sustain(v.clamp(0.0, 1.0)),
+            Event::NoteOn { key, vel } if vel > 0 => {
+                let key = key & 127;
+                if self.current == InstrumentKind::GrandPiano {
+                    self.note_on(key, vel)
+                } else {
+                    self.synth_note_on(key, vel)
+                }
+            }
+            Event::NoteOn { key, .. } | Event::NoteOff { key } => {
+                let key = key & 127;
+                self.note_off(key);
+                self.synth_note_off(key);
+            }
+            Event::Sustain(v) => {
+                let v = v.clamp(0.0, 1.0);
+                self.sustain(v);
+                self.mono.sustain(v >= 0.5);
+                self.strings.sustain(v >= 0.5);
+            }
             Event::AllNotesOff => {
                 for k in 0..128u8 {
                     if self.keys[k as usize].down {
                         self.note_off(k);
                     }
                 }
+                self.synth_release_all();
             }
             Event::Panic => {
+                self.mono.panic();
+                self.strings.panic();
+                self.synth_down = [false; 128];
                 for v in self.voices.iter_mut().filter(|v| v.active) {
                     v.fading = true;
                     v.fade_mul = (-1.0 / (0.01 * self.sr)).exp();
@@ -385,7 +497,10 @@ impl Engine {
 
     /// Renders interleaved stereo into `out` (len = frames * 2).
     pub fn process(&mut self, out: &mut [f32]) {
+        self.sync_instrument();
         self.drain_events();
+        let block_start_us = now_us();
+        let synth = self.current.is_synth();
         let frames = out.len() / 2;
         let mut done = 0;
         let mut peak = 0f32;
@@ -395,8 +510,10 @@ impl Engine {
             self.render_block(n);
             let vol_t = volume_gain(self.params.volume.get());
             let rev_t = self.params.reverb.get();
-            let mod_t = self.params.modulation.get();
-            let tone = self.tone_amt.next(self.params.tone.get());
+            // The piano's tone filter and shimmer stay neutral on the synths:
+            // there Tone is the filter cutoff and the wheel is vibrato.
+            let mod_t = if synth { 0.0 } else { self.params.modulation.get() };
+            let tone = self.tone_amt.next(if synth { 0.5 } else { self.params.tone.get() });
             self.tone.update(tone);
             for i in 0..n {
                 let (l, r) = self.tone.tick(self.dry[i * 2], self.dry[i * 2 + 1]);
@@ -413,6 +530,34 @@ impl Engine {
                 out[(done + i) * 2] = ol;
                 out[(done + i) * 2 + 1] = or;
             }
+            // metronome: mixed after the effects and the limiter
+            let mc = MetroControls {
+                running: self.params.metro_running.load(Ordering::Relaxed),
+                bpm: self.params.tempo_bpm(),
+                beats_per_bar: self.params.beats_per_bar.load(Ordering::Relaxed),
+                click_on: self.params.click_on.load(Ordering::Relaxed),
+                level: self.params.click_level.get(),
+            };
+            if mc.running || self.metro.busy() {
+                let mut beat: Option<(usize, u8)> = None;
+                let seg = &mut out[done * 2..(done + n) * 2];
+                if self.metro.process(seg, n, mc, |off, b| beat = Some((off, b))) {
+                    // keep instrument + click from clipping (identity below 0.8)
+                    for x in seg.iter_mut() {
+                        *x = soft_clip(*x);
+                        peak = peak.max(x.abs());
+                    }
+                }
+                if let Some((off, b)) = beat {
+                    // when this beat leaves the speakers: block time + offset + output
+                    // latency (minus the 1 ms limiter look-ahead the click skips)
+                    let lat_ms = (self.params.output_latency_ms.get() - 1.0).max(0.0);
+                    let t = block_start_us + (((done + off) as f32 / self.sr) * 1e6) as u64 + (lat_ms * 1000.0) as u64;
+                    self.params.beat_in_bar.store(b, Ordering::Relaxed);
+                    self.params.beat_audible_us.store(t, Ordering::Relaxed);
+                    self.params.beat_seq.fetch_add(1, Ordering::Release);
+                }
+            }
             done += n;
         }
         // telemetry
@@ -427,6 +572,9 @@ impl Engine {
                 sounding[(v.key / 64) as usize] |= 1 << (v.key % 64);
             }
         }
+        self.mono.sounding(&mut sounding);
+        self.strings.sounding(&mut sounding);
+        count += (self.mono.active_voices() + self.strings.active_voices()) as u32;
         self.params.keys_sounding[0].store(sounding[0], Ordering::Relaxed);
         self.params.keys_sounding[1].store(sounding[1], Ordering::Relaxed);
         self.params.active_voices.store(count, Ordering::Relaxed);
@@ -443,6 +591,15 @@ impl Engine {
         let lift = ((self.pedal - 0.15) / 0.7).clamp(0.0, 1.0);
         let lift = lift * lift * (3.0 - 2.0 * lift);
         let damping = (1.0 - lift) * (1.0 - lift);
+        // pitch bend on the piano (off unless allowed in Settings): playback rate,
+        // interpolated across the block
+        let bend_target = if self.current == InstrumentKind::GrandPiano { self.params.bend_semis(InstrumentKind::GrandPiano) } else { 0.0 };
+        let b0 = self.piano_bend_mul;
+        let b1 = 2f32.powf(bend_target / 12.0);
+        // limit the change per block (~a semitone per 30 ms at most) so steps don't zipper
+        let b1 = b0 + (b1 - b0).clamp(-0.0025 * b0, 0.0025 * b0);
+        self.piano_bend_mul = if (b1 - 1.0).abs() < 1e-6 && bend_target == 0.0 { 1.0 } else { b1 };
+        let bending = b0 != 1.0 || b1 != 1.0;
         let inst = &*self.inst;
         let sr = self.sr;
         let dry = &mut self.dry;
@@ -481,7 +638,7 @@ impl Engine {
                 dry[i * 2] += hl * k;
                 dry[i * 2 + 1] += hr * k;
                 env *= mul;
-                frac += inc;
+                frac += if bending { inc * (b0 + (b1 - b0) * (i as f32 / n as f32)) } else { inc };
                 let adv = frac as usize;
                 pos += adv;
                 frac -= adv as f32;
@@ -493,6 +650,20 @@ impl Engine {
                 v.active = false;
             }
         }
+        // synths (they also finish releasing after a switch back to the piano)
+        let p = &self.params;
+        let cur = self.current;
+        let bend_for = |i: InstrumentKind| if cur == i { p.bend_semis(i) } else { 0.0 };
+        let mc = MonoControls {
+            cutoff: p.synth_cutoff[1].get(),
+            resonance: p.resonance.get(),
+            glide: p.glide.get(),
+            vibrato: p.vibrato.get(),
+            bend: bend_for(InstrumentKind::MonoSynth),
+        };
+        self.mono.render(&mut self.dry[..n * 2], n, mc);
+        let sc = StringControls { cutoff: p.synth_cutoff[2].get(), vibrato: p.vibrato.get(), bend: bend_for(InstrumentKind::StringMachine) };
+        self.strings.render(&mut self.dry[..n * 2], n, sc);
         self.clock += n as u64;
     }
 
@@ -651,6 +822,28 @@ mod tests {
         e.handle(Event::Panic);
         e.render(48000);
         assert_eq!(e.active_voices(), 0);
+    }
+
+    #[test]
+    fn fast_volume_fader_moves_dont_zipper() {
+        // a held string chord while the volume fader is thrown 0 -> 127 -> 0
+        // in about 0.3 s each way, one CC step per 64 samples
+        let params = Arc::new(Params::default());
+        params.reverb.set(0.0);
+        params.set_instrument(crate::params::InstrumentKind::StringMachine);
+        let mut e = Engine::new(Arc::new(testlib::instrument()), params, 48000);
+        for k in [60, 64, 67] {
+            e.handle(Event::NoteOn { key: k, vel: 100 });
+        }
+        e.render(9600);
+        let mut out = Vec::new();
+        for cc in (0..=127u32).chain((0..=127).rev()) {
+            e.params.volume.set(cc as f32 / 127.0);
+            out.extend(e.render(64));
+        }
+        let st = crate::analysis::synth_stats(&out, 48000);
+        assert_eq!(st.clicks, 0, "worst {}", st.worst_click_ratio);
+        assert!(out.iter().all(|x| x.is_finite()));
     }
 
     #[test]

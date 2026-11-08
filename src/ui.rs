@@ -9,7 +9,7 @@ use grand_piano::download::{self, DownloadProgress};
 use grand_piano::engine::{Engine, Event};
 use grand_piano::library::{self, Instrument, LoadProgress};
 use grand_piano::mapping::Mapper;
-use grand_piano::params::{self, Params, Target, VelocityMode};
+use grand_piano::params::{self, InstrumentKind, Params, Target, VelocityMode};
 use grand_piano::settings::{AudioMode, Settings};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
@@ -61,6 +61,16 @@ pub struct App {
     midi_flash: Instant,
     dirty: bool,
     last_save: Instant,
+    beat: BeatView,
+}
+
+/// What the beat light shows: the newest beat the audio thread reported and the
+/// one before it, each with the time it leaves the speakers.
+#[derive(Default)]
+struct BeatView {
+    seq: u32,
+    cur: Option<(u64, u8)>,
+    prev: Option<(u64, u8)>,
 }
 
 impl App {
@@ -95,6 +105,7 @@ impl App {
             midi_flash: Instant::now() - Duration::from_secs(5),
             dirty: false,
             last_save: Instant::now(),
+            beat: BeatView::default(),
         };
         app.start_loading(ctx);
         app
@@ -140,6 +151,7 @@ impl App {
         match audio_win::start(self.settings.audio_device.clone(), self.settings.audio_mode, self.settings.buffer_frames, make) {
             Ok(h) => {
                 log::info!("audio: {:?}", h.info);
+                self.params.output_latency_ms.set(h.info.estimated_latency_ms);
                 self.audio = Some(h);
                 self.audio_error = None;
                 self.audio_retry = None;
@@ -223,7 +235,15 @@ impl eframe::App for App {
         if self.show_about {
             self.about_window(&ctx);
         }
+        let metro = self.params.metro_running.load(Ordering::Relaxed);
+        if metro {
+            // the beat light: redraw at least every 16 ms, and right when the next beat is heard
+            let now = params::now_us();
+            let next = self.beat.cur.map(|(t, _)| t).filter(|t| *t > now).map(|t| Duration::from_micros(t - now));
+            ctx.request_repaint_after(next.unwrap_or(Duration::from_millis(16)).min(Duration::from_millis(16)));
+        }
         let busy = !matches!(self.phase, Phase::Ready)
+            || metro
             || self.mapper.learning().is_some()
             || self.params.keys_sounding[0].load(Ordering::Relaxed) != 0
             || self.params.keys_sounding[1].load(Ordering::Relaxed) != 0
@@ -292,29 +312,298 @@ impl App {
         // ---- header
         let header = Rect::from_min_size(inner.min, vec2(inner.width(), 40.0));
         self.header(ui, header);
-        // ---- keyboard at the bottom
-        let kb_h = (inner.height() * 0.30).clamp(110.0, 190.0);
+        // ---- keyboard at the bottom, with the octave row above it
+        let kb_h = (inner.height() * 0.26).clamp(100.0, 180.0);
         let kb = Rect::from_min_max(pos2(inner.min.x, inner.max.y - kb_h), inner.max);
         self.keyboard(ui, kb);
-        // ---- middle area: knobs + mode row
-        let mid = Rect::from_min_max(pos2(inner.min.x, header.max.y + 14.0), pos2(inner.max.x, kb.min.y - 18.0));
-        ui.painter().rect_filled(mid, CornerRadius::same(18), PANEL);
-        let knob_h = (mid.height() * 0.62).max(150.0);
-        let knob_area = Rect::from_min_size(mid.min, vec2(mid.width(), knob_h));
-        let targets = [Target::Volume, Target::Tone, Target::Reverb, Target::Modulation, Target::Touch];
+        let kb_row = Rect::from_min_max(pos2(inner.min.x, kb.min.y - 36.0), pos2(inner.max.x, kb.min.y - 8.0));
+        self.keyboard_row(ui, kb_row);
+        // ---- middle: instrument panel (left) and metronome (right)
+        let mid = Rect::from_min_max(pos2(inner.min.x, header.max.y + 14.0), pos2(inner.max.x, kb_row.min.y - 6.0));
+        let metro_w = if mid.width() > 1050.0 { 280.0 } else { 250.0 };
+        let metro = Rect::from_min_max(pos2(mid.max.x - metro_w, mid.min.y), mid.max);
+        let left = Rect::from_min_max(mid.min, pos2(metro.min.x - 14.0, mid.max.y));
+        ui.painter().rect_filled(left, CornerRadius::same(18), PANEL);
+        ui.painter().rect_filled(metro, CornerRadius::same(18), PANEL);
+        let strip = Rect::from_min_size(left.min, vec2(left.width(), 72.0));
+        self.instrument_strip(ui, strip);
+        let row_h = 104.0;
+        let knob_area = Rect::from_min_max(pos2(left.min.x, strip.max.y), pos2(left.max.x, (left.max.y - row_h).max(strip.max.y + 120.0)));
+        let targets: &[Target] = match self.params.instrument() {
+            InstrumentKind::GrandPiano => &[Target::Volume, Target::Tone, Target::Reverb, Target::Modulation, Target::Touch],
+            InstrumentKind::MonoSynth => &[Target::Volume, Target::Tone, Target::Resonance, Target::Glide, Target::Reverb, Target::Modulation, Target::Touch],
+            InstrumentKind::StringMachine => &[Target::Volume, Target::Tone, Target::Reverb, Target::Modulation, Target::Touch],
+        };
         let w = knob_area.width() / targets.len() as f32;
         for (i, t) in targets.iter().enumerate() {
-            let r = Rect::from_min_size(pos2(knob_area.min.x + w * i as f32, knob_area.min.y), vec2(w, knob_h));
+            let r = Rect::from_min_size(pos2(knob_area.min.x + w * i as f32, knob_area.min.y), vec2(w, knob_area.height()));
             self.knob(ui, r, *t);
         }
-        let row = Rect::from_min_max(pos2(mid.min.x, knob_area.max.y), mid.max);
+        let row = Rect::from_min_max(pos2(left.min.x, knob_area.max.y), left.max);
         self.mode_row(ui, row);
+        self.metronome_panel(ui, metro);
+    }
+
+    /// The row above the on-screen keyboard: the hardware range (inferred) on the
+    /// left, the app's own octave shift (exact) on the right.
+    fn keyboard_row(&mut self, ui: &mut egui::Ui, r: Rect) {
+        let p = ui.painter().clone();
+        let cy = r.center().y;
+        let (lo, hi) = self.sounding_span();
+        let hw = self.params.hw_octave.load(Ordering::Relaxed);
+        let seen = self.params.hw_seen.load(Ordering::Relaxed);
+        spaced(&p, pos2(r.min.x + 4.0, cy), "KEYBOARD", 11.0, MUTED, Align2::LEFT_CENTER);
+        let txt = if seen {
+            format!("Oct {} (detected) · plays {}–{}", signed(hw), note_name(lo), note_name(hi))
+        } else {
+            format!("Oct 0 (assumed; updates once you play) · plays {}–{}", note_name(lo), note_name(hi))
+        };
+        let g = p.layout_no_wrap(txt, FontId::proportional(12.5), TEXT);
+        let tx = r.min.x + 92.0;
+        p.galley(pos2(tx, cy - g.size().y / 2.0), g.clone(), TEXT);
+        let hover = ui.interact(Rect::from_min_size(pos2(tx, cy - 9.0), vec2(g.size().x, 18.0)), ui.make_persistent_id("hw_range"), Sense::hover());
+        hover.on_hover_text(
+            "The keyboard's own Octave buttons don't send any MIDI, so this is worked out from the notes you play: \
+             when a note falls outside the highlighted span, the span moves to the nearest octave that fits the last few seconds of playing.",
+        );
+        // right: [chip] [−] Oct +1 [+] [chip]
+        let oct = self.params.octave.load(Ordering::Relaxed);
+        let tr = self.params.transpose.load(Ordering::Relaxed);
+        let mut x = r.max.x;
+        let chip_w = 70.0;
+        self.mapping_chip(ui, pos2(x - chip_w / 2.0, cy), Target::OctaveUp);
+        x -= chip_w + 6.0;
+        let plus = Rect::from_center_size(pos2(x - 14.0, cy), vec2(28.0, 26.0));
+        x -= 28.0;
+        let readout = if tr != 0 { format!("Oct {} · Tr {}", signed(oct), signed(tr)) } else { format!("Oct {}", signed(oct)) };
+        let rw = if tr != 0 { 110.0 } else { 64.0 };
+        let rr = Rect::from_center_size(pos2(x - rw / 2.0, cy), vec2(rw, 26.0));
+        x -= rw;
+        let minus = Rect::from_center_size(pos2(x - 14.0, cy), vec2(28.0, 26.0));
+        x -= 28.0 + 6.0;
+        self.mapping_chip(ui, pos2(x - chip_w / 2.0, cy), Target::OctaveDown);
+        x -= chip_w + 4.0;
+        spaced(&p, pos2(x, cy), "OCTAVE", 11.0, MUTED, Align2::RIGHT_CENTER);
+        p.rect_filled(Rect::from_min_max(minus.min, plus.max), CornerRadius::same(13), RAISED);
+        p.text(rr.center(), Align2::CENTER_CENTER, readout, FontId::proportional(13.5), if oct != 0 || tr != 0 { ACCENT } else { TEXT });
+        for (b, sym, d) in [(minus, "−", -1), (plus, "+", 1)] {
+            let resp = ui.interact(b, ui.make_persistent_id(("oct", d)), Sense::click());
+            p.text(b.center(), Align2::CENTER_CENTER, sym, FontId::proportional(17.0), if resp.hovered() { ACCENT } else { MUTED });
+            if resp.clicked() {
+                self.params.step_octave(d);
+                self.dirty = true;
+            }
+        }
+        let rresp = ui.interact(rr, ui.make_persistent_id("oct_readout"), Sense::click());
+        if rresp.double_clicked() {
+            self.params.octave.store(0, Ordering::Relaxed);
+            self.dirty = true;
+        }
+        rresp.on_hover_text("The app's own octave shift (exact), added to every note from the keyboard. Double-click to reset. Transpose is in Settings.");
+    }
+
+    /// The notes the hardware keyboard currently plays: its inferred span plus the app's shift.
+    fn sounding_span(&self) -> (i32, i32) {
+        let hw = self.params.hw_octave.load(Ordering::Relaxed);
+        let (lo, hi) = grand_piano::keyrange::RangeDetector::span(hw);
+        let s = self.params.note_shift();
+        (lo + s, hi + s)
+    }
+
+    /// Instrument selector (left) and preset selector (right), each with a MIDI-learn chip.
+    fn instrument_strip(&mut self, ui: &mut egui::Ui, r: Rect) {
+        let p = ui.painter().clone();
+        let cur = self.params.instrument();
+        let h = 34.0;
+        let y = r.min.y + 14.0;
+        let pad = 20.0;
+        let seg = ((r.width() * 0.56) / 3.0).clamp(88.0, 128.0);
+        let total = Rect::from_min_size(pos2(r.min.x + pad, y), vec2(seg * 3.0, h));
+        p.rect_filled(total, CornerRadius::same(17), RAISED);
+        for (i, k) in InstrumentKind::ALL.iter().enumerate() {
+            let sr = Rect::from_min_size(pos2(total.min.x + seg * i as f32, total.min.y), vec2(seg, h));
+            let resp = ui.interact(sr, ui.make_persistent_id(("inst", i)), Sense::click());
+            let sel = *k == cur;
+            if sel {
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), ACCENT);
+            } else if resp.hovered() {
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), LINE);
+            }
+            p.text(sr.center(), Align2::CENTER_CENTER, k.label(), FontId::proportional(14.0), if sel { BG } else { TEXT });
+            if resp.clicked() {
+                self.params.set_instrument(*k);
+                self.dirty = true;
+            }
+            resp.on_hover_text(k.description());
+        }
+        self.mapping_chip(ui, pos2(total.center().x, total.max.y + 15.0), Target::Instrument);
+        let names = cur.presets();
+        if names.is_empty() {
+            return;
+        }
+        let n = names.len() as f32;
+        let ps = ((r.width() * 0.36) / n).clamp(60.0, 92.0);
+        let ptotal = Rect::from_min_size(pos2(r.max.x - pad - ps * n, y), vec2(ps * n, h));
+        if ptotal.min.x - 70.0 > total.max.x {
+            spaced(&p, pos2(ptotal.min.x - 12.0, ptotal.center().y), "PRESET", 11.0, MUTED, Align2::RIGHT_CENTER);
+        }
+        p.rect_filled(ptotal, CornerRadius::same(17), RAISED);
+        let sel_idx = self.params.preset_of(cur);
+        for (i, name) in names.iter().enumerate() {
+            let sr = Rect::from_min_size(pos2(ptotal.min.x + ps * i as f32, ptotal.min.y), vec2(ps, h));
+            let resp = ui.interact(sr, ui.make_persistent_id(("preset", i)), Sense::click());
+            let sel = i == sel_idx;
+            if sel {
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), ACCENT);
+            } else if resp.hovered() {
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), LINE);
+            }
+            p.text(sr.center(), Align2::CENTER_CENTER, *name, FontId::proportional(14.0), if sel { BG } else { TEXT });
+            if resp.clicked() {
+                self.params.select_preset(cur, i);
+                self.dirty = true;
+            }
+        }
+        self.mapping_chip(ui, pos2(ptotal.center().x, ptotal.max.y + 15.0), Target::Preset);
+    }
+
+    /// The beat light's brightness (0..1) and the beat-in-bar to show, from the
+    /// audio thread's beat times (already shifted by the output latency).
+    fn beat_light(&mut self, now: u64) -> (f32, Option<u8>) {
+        let seq = self.params.beat_seq.load(Ordering::Acquire);
+        if seq != self.beat.seq {
+            self.beat.seq = seq;
+            self.beat.prev = self.beat.cur;
+            self.beat.cur = Some((self.params.beat_audible_us.load(Ordering::Relaxed), self.params.beat_in_bar.load(Ordering::Relaxed)));
+        }
+        let shown = match self.beat.cur {
+            Some((t, b)) if now >= t => Some((t, b)),
+            _ => self.beat.prev.filter(|(t, _)| now >= *t),
+        };
+        match shown {
+            Some((t, b)) => {
+                let age = (now - t) as f32 / 1e6;
+                let base = if b == 0 { 1.0 } else { 0.55 };
+                (if age < 0.6 { base * (-age / 0.12).exp() } else { 0.0 }, Some(b))
+            }
+            None => (0.0, None),
+        }
+    }
+
+    fn metronome_panel(&mut self, ui: &mut egui::Ui, r: Rect) {
+        let p = ui.painter().clone();
+        let inner = r.shrink2(vec2(18.0, 12.0));
+        let running = self.params.metro_running.load(Ordering::Relaxed);
+        let bpb = self.params.beats_per_bar.load(Ordering::Relaxed).clamp(2, 6);
+        let blink = self.params.blink_on.load(Ordering::Relaxed);
+        let now = params::now_us();
+        let (lamp, beat_idx) = if running { self.beat_light(now) } else { (0.0, None) };
+        let lamp = if blink { lamp } else { 0.0 };
+        // ---- title and beat dots
+        let ay = inner.min.y + 12.0;
+        spaced(&p, pos2(inner.min.x, ay), "METRONOME", 11.5, MUTED, Align2::LEFT_CENTER);
+        for b in 0..bpb {
+            let x = inner.max.x - (bpb - 1 - b) as f32 * 16.0 - 5.0;
+            let lit = blink && beat_idx == Some(b);
+            let rad = if b == 0 { 5.0 } else { 3.8 };
+            p.circle_filled(pos2(x, ay), rad, if lit { ACCENT } else { LINE });
+        }
+        // ---- tempo knob, big BPM readout, beat lamp, tap
+        let b_top = ay + 18.0;
+        let bh = 124.0;
+        let knob_r = Rect::from_min_size(pos2(inner.min.x - 6.0, b_top), vec2(inner.width() * 0.46, bh));
+        self.knob(ui, knob_r, Target::Tempo);
+        let right = Rect::from_min_max(pos2(knob_r.max.x + 6.0, b_top), pos2(inner.max.x, b_top + bh));
+        let lamp_c = pos2(right.min.x + 13.0, b_top + 30.0);
+        if lamp > 0.01 {
+            p.circle_filled(lamp_c, 11.0 + 9.0 * lamp, ACCENT.gamma_multiply(0.22 * lamp));
+        }
+        p.circle_filled(lamp_c, 11.0, lerp_color(RAISED, ACCENT, lamp.min(1.0)));
+        p.circle_stroke(lamp_c, 11.0, Stroke::new(1.0, LINE));
+        let bpm = self.params.tempo_bpm();
+        p.text(pos2(right.max.x, b_top + 30.0), Align2::RIGHT_CENTER, format!("{bpm:.0}"), FontId::proportional(40.0), TEXT);
+        spaced(&p, pos2(right.max.x, b_top + 60.0), "BPM", 10.5, MUTED, Align2::RIGHT_CENTER);
+        let tap_r = Rect::from_min_size(pos2(right.max.x - 76.0, b_top + 74.0), vec2(76.0, 28.0));
+        let tap = pill_button(ui, tap_r, "TAP", false);
+        if tap.clicked() {
+            self.params.tap(params::now_us());
+            self.dirty = true;
+        }
+        tap.on_hover_text("Tap on the beat a few times to set the tempo.");
+        self.mapping_chip(ui, pos2(tap_r.center().x, tap_r.max.y + 13.0), Target::TapTempo);
+        // ---- start / stop
+        let c_top = b_top + bh + 6.0;
+        let btn = Rect::from_min_size(pos2(inner.min.x, c_top), vec2(inner.width() - 80.0, 46.0));
+        let resp = ui.interact(btn, ui.make_persistent_id("metro_start"), Sense::click());
+        let fill = match (running, resp.hovered()) {
+            (true, true) => lerp_color(ACCENT, TEXT, 0.2),
+            (true, false) => ACCENT,
+            (false, true) => LINE,
+            (false, false) => RAISED,
+        };
+        p.rect_filled(btn, CornerRadius::same(23), fill);
+        let fg = if running { BG } else { TEXT };
+        let ic = pos2(btn.center().x - 34.0, btn.center().y);
+        if running {
+            p.rect_filled(Rect::from_center_size(ic, vec2(13.0, 13.0)), CornerRadius::same(2), fg);
+        } else {
+            p.add(Shape::convex_polygon(vec![ic + vec2(-6.0, -8.0), ic + vec2(9.0, 0.0), ic + vec2(-6.0, 8.0)], fg, Stroke::NONE));
+        }
+        p.text(pos2(ic.x + 18.0, btn.center().y), Align2::LEFT_CENTER, if running { "STOP" } else { "START" }, FontId::proportional(17.0), fg);
+        if resp.clicked() {
+            self.params.toggle_metronome();
+        }
+        self.mapping_chip(ui, pos2(btn.max.x + 40.0, btn.center().y), Target::MetronomeStartStop);
+        // ---- click / blink toggles, beats per bar
+        let d_top = btn.max.y + 10.0;
+        let step_w = 96.0;
+        let tw = (inner.width() - step_w - 12.0) / 2.0;
+        let click_on = self.params.click_on.load(Ordering::Relaxed);
+        if toggle_pill(ui, Rect::from_min_size(pos2(inner.min.x, d_top), vec2(tw, 28.0)), "Click", click_on).clicked() {
+            self.params.click_on.store(!click_on, Ordering::Relaxed);
+            self.dirty = true;
+        }
+        if toggle_pill(ui, Rect::from_min_size(pos2(inner.min.x + tw + 6.0, d_top), vec2(tw, 28.0)), "Blink", blink).clicked() {
+            self.params.blink_on.store(!blink, Ordering::Relaxed);
+            self.dirty = true;
+        }
+        let st = Rect::from_min_size(pos2(inner.max.x - step_w, d_top), vec2(step_w, 28.0));
+        p.rect_filled(st, CornerRadius::same(14), RAISED);
+        let minus = Rect::from_min_size(st.min, vec2(28.0, 28.0));
+        let plus = Rect::from_min_size(pos2(st.max.x - 28.0, st.min.y), vec2(28.0, 28.0));
+        for (rr, sym, d) in [(minus, "−", -1i32), (plus, "+", 1)] {
+            let rsp = ui.interact(rr, ui.make_persistent_id(("bpb", d)), Sense::click());
+            p.text(rr.center(), Align2::CENTER_CENTER, sym, FontId::proportional(16.0), if rsp.hovered() { ACCENT } else { MUTED });
+            if rsp.clicked() {
+                let v = (bpb as i32 + d).clamp(2, 6) as u8;
+                self.params.beats_per_bar.store(v, Ordering::Relaxed);
+                self.dirty = true;
+            }
+        }
+        p.text(st.center(), Align2::CENTER_CENTER, format!("{bpb}/bar"), FontId::proportional(13.0), TEXT);
+        // ---- click level
+        let e_y = d_top + 28.0 + 18.0;
+        spaced(&p, pos2(inner.min.x, e_y), "LEVEL", 10.5, MUTED, Align2::LEFT_CENTER);
+        let bar = Rect::from_min_max(pos2(inner.min.x + 58.0, e_y - 4.0), pos2(inner.max.x, e_y + 4.0));
+        p.rect_filled(bar, CornerRadius::same(4), RAISED);
+        let lvl = self.params.click_level.get();
+        let mut f = bar;
+        f.set_width(bar.width() * lvl);
+        p.rect_filled(f, CornerRadius::same(4), if click_on { ACCENT } else { FAINT });
+        let lr = ui.interact(bar.expand(8.0), ui.make_persistent_id("click_level"), Sense::click_and_drag());
+        if lr.is_pointer_button_down_on() {
+            if let Some(pp) = lr.interact_pointer_pos() {
+                self.params.click_level.set(((pp.x - bar.min.x) / bar.width()).clamp(0.0, 1.0));
+                self.dirty = true;
+            }
+        }
+        lr.on_hover_text(format!("Click level {:.0}%", lvl * 100.0));
     }
 
     fn header(&mut self, ui: &mut egui::Ui, r: Rect) {
         let p = ui.painter().clone();
         spaced(&p, pos2(r.min.x, r.center().y - 7.0), "GRAND PIANO", 19.0, TEXT, Align2::LEFT_CENTER);
-        p.text(pos2(r.min.x, r.center().y + 13.0), Align2::LEFT_CENTER, "Salamander Grand · Yamaha C5", FontId::proportional(12.0), MUTED);
+        p.text(pos2(r.min.x, r.center().y + 13.0), Align2::LEFT_CENTER, self.params.instrument().description(), FontId::proportional(12.0), MUTED);
         // right side, laid out right-to-left
         let mut x = r.max.x;
         let info_r = Rect::from_center_size(pos2(x - 16.0, r.center().y), vec2(32.0, 32.0));
@@ -410,21 +699,32 @@ impl App {
 
     fn knob(&mut self, ui: &mut egui::Ui, area: Rect, t: Target) {
         let mode = self.params.mode();
+        let synth = self.params.instrument().is_synth();
         let label = match t {
             Target::Touch if mode == VelocityMode::Fixed => "LEVEL",
             Target::Touch => "TOUCH",
-            other => match other {
-                Target::Volume => "VOLUME",
-                Target::Tone => "TONE",
-                Target::Reverb => "ROOM",
-                Target::Modulation => "SHIMMER",
-                _ => "",
-            },
+            Target::Volume => "VOLUME",
+            Target::Tone if synth => "CUTOFF",
+            Target::Tone => "TONE",
+            Target::Reverb => "ROOM",
+            Target::Modulation if synth => "VIBRATO",
+            Target::Modulation => "SHIMMER",
+            Target::Resonance => "RESONANCE",
+            Target::Glide => "GLIDE",
+            Target::Tempo => "TEMPO",
+            _ => "",
         };
-        let radius = (area.width() * 0.26).min(area.height() * 0.24).clamp(30.0, 58.0);
-        let center = pos2(area.center().x, area.min.y + 34.0 + radius + 8.0);
+        // the metronome's tempo knob is compact: its value is the big BPM readout
+        let compact = t == Target::Tempo;
+        let radius = if compact {
+            ((area.height() - 70.0) / 2.0 - 10.0).min(area.width() * 0.3).clamp(18.0, 40.0)
+        } else {
+            ((area.height() - 106.0) / 2.0).min(area.width() * 0.26).clamp(22.0, 58.0)
+        };
+        let center = if compact { pos2(area.center().x, area.min.y + 22.0 + radius + 10.0) } else { pos2(area.center().x, area.min.y + 34.0 + radius + 8.0) };
         let p = ui.painter().clone();
-        spaced(&p, pos2(center.x, area.min.y + 26.0), label, 11.5, MUTED, Align2::CENTER_CENTER);
+        let label_size = (area.width() / 10.0).clamp(8.5, 11.5);
+        spaced(&p, pos2(center.x, if compact { area.min.y + 10.0 } else { area.min.y + 26.0 }), label, label_size, MUTED, Align2::CENTER_CENTER);
         let hit = Rect::from_center_size(center, Vec2::splat(radius * 2.3));
         let resp = ui.interact(hit, ui.make_persistent_id(("knob", t.id())), Sense::click_and_drag());
         let mut v = self.params.get_target(t);
@@ -438,7 +738,7 @@ impl App {
             v += s / 600.0;
         }
         if resp.double_clicked() {
-            v = default_of(t, mode);
+            v = default_of(&self.params, t);
         }
         let v = v.clamp(0.0, 1.0);
         if (v - self.params.get_target(t)).abs() > 1e-6 {
@@ -462,16 +762,21 @@ impl App {
         let dir = vec2(ang.cos(), ang.sin());
         p.line_segment([center + dir * radius * 0.35, center + dir * radius * 0.78], Stroke::new(3.0, if resp.hovered() || resp.dragged() { ACCENT } else { TEXT }));
         // value
-        let value = value_text(&self.params, t);
-        p.text(pos2(center.x, center.y + ring + 18.0), Align2::CENTER_CENTER, value, FontId::proportional(15.0), TEXT);
-        self.mapping_chip(ui, pos2(center.x, center.y + ring + 44.0), t);
+        if compact {
+            self.mapping_chip(ui, pos2(center.x, center.y + ring + 16.0), t);
+        } else {
+            let value = value_text(&self.params, t);
+            p.text(pos2(center.x, center.y + ring + 18.0), Align2::CENTER_CENTER, value, FontId::proportional(15.0), TEXT);
+            self.mapping_chip(ui, pos2(center.x, center.y + ring + 44.0), t);
+        }
     }
 
     fn mode_row(&mut self, ui: &mut egui::Ui, row: Rect) {
         let p = ui.painter().clone();
         let cy = row.min.y + row.height() * 0.42;
         // velocity mode segmented switch, centred
-        let seg_w = 112.0;
+        let meter_w = (row.width() * 0.2).clamp(100.0, 150.0);
+        let seg_w = ((row.width() - 2.0 * (meter_w + 44.0)) / 3.0).clamp(70.0, 112.0);
         let seg_h = 42.0;
         let total = Rect::from_center_size(pos2(row.center().x, cy), vec2(seg_w * 3.0, seg_h));
         spaced(&p, pos2(total.center().x, total.min.y - 16.0), "VELOCITY", 11.5, MUTED, Align2::CENTER_CENTER);
@@ -503,7 +808,7 @@ impl App {
         // left: output meter, voices, last velocity
         let left_x = row.min.x + 34.0;
         let peak = self.params.out_peak.get();
-        let meter = Rect::from_min_size(pos2(left_x, cy - 4.0), vec2(150.0, 8.0));
+        let meter = Rect::from_min_size(pos2(left_x, cy - 4.0), vec2(meter_w, 8.0));
         spaced(&p, pos2(left_x, meter.min.y - 16.0), "OUTPUT", 11.5, MUTED, Align2::LEFT_CENTER);
         p.rect_filled(meter, CornerRadius::same(4), RAISED);
         let db = grand_piano::analysis::db(peak).max(-48.0);
@@ -515,16 +820,18 @@ impl App {
         let voices = self.params.active_voices.load(Ordering::Relaxed);
         let vin = self.params.last_velocity_in.load(Ordering::Relaxed);
         let vout = self.params.last_velocity_out.load(Ordering::Relaxed);
-        let info = if vin > 0 { format!("{voices} voices   ·   velocity {vin} → {vout}") } else { format!("{voices} voices") };
-        p.text(pos2(left_x, meter.max.y + 16.0), Align2::LEFT_CENTER, info, FontId::proportional(12.5), MUTED);
+        p.text(pos2(left_x, meter.max.y + 16.0), Align2::LEFT_CENTER, format!("{voices} voices"), FontId::proportional(12.5), MUTED);
+        if vin > 0 {
+            p.text(pos2(left_x, meter.max.y + 32.0), Align2::LEFT_CENTER, format!("velocity {vin} → {vout}"), FontId::proportional(12.0), MUTED);
+        }
         if gr < -0.5 {
-            p.text(pos2(left_x, meter.max.y + 34.0), Align2::LEFT_CENTER, format!("limiter {gr:.1} dB"), FontId::proportional(11.5), LEARN);
+            p.text(pos2(left_x, meter.max.y + 48.0), Align2::LEFT_CENTER, format!("limiter {gr:.1} dB"), FontId::proportional(11.5), LEARN);
         }
 
         // right: sustain pedal
         let sx = row.max.x - 34.0;
         let sus = self.params.sustain.get();
-        let bar = Rect::from_min_size(pos2(sx - 150.0, cy - 4.0), vec2(150.0, 8.0));
+        let bar = Rect::from_min_size(pos2(sx - meter_w, cy - 4.0), vec2(meter_w, 8.0));
         spaced(&p, pos2(bar.max.x, bar.min.y - 16.0), "SUSTAIN", 11.5, MUTED, Align2::RIGHT_CENTER);
         p.rect_filled(bar, CornerRadius::same(4), RAISED);
         let mut f = bar;
@@ -542,6 +849,27 @@ impl App {
             self.sink.send(Event::Sustain(0.0));
         }
         self.mapping_chip(ui, pos2(bar.center().x + 40.0, bar.max.y + 22.0), Target::Sustain);
+
+        // pitch bend indicator: centre mark, fill from the centre towards the bend
+        let inst = self.params.instrument();
+        let wheel = self.params.pitch_bend.get();
+        let semis = self.params.bend_semis(inst);
+        let by = (bar.max.y + 46.0).min(row.max.y - 8.0);
+        let bb = Rect::from_min_size(pos2(bar.min.x + 48.0, by - 3.0), vec2(bar.width() - 48.0, 6.0));
+        spaced(&p, pos2(bar.min.x, by), "BEND", 10.5, MUTED, Align2::LEFT_CENTER);
+        p.rect_filled(bb, CornerRadius::same(3), RAISED);
+        let c = bb.center().x;
+        let ignored = inst == InstrumentKind::GrandPiano && !self.params.piano_bend.load(Ordering::Relaxed);
+        if wheel.abs() > 0.002 {
+            let x = c + wheel * bb.width() / 2.0;
+            let fr = Rect::from_min_max(pos2(c.min(x), bb.min.y), pos2(c.max(x), bb.max.y));
+            p.rect_filled(fr, CornerRadius::same(3), if ignored { FAINT } else { ACCENT });
+        }
+        p.line_segment([pos2(c, bb.min.y - 3.0), pos2(c, bb.max.y + 3.0)], Stroke::new(1.0, MUTED));
+        let txt = if ignored { "off".to_string() } else if semis.abs() < 0.05 { "0".into() } else { format!("{semis:+.1}") };
+        let bend_hover = ui.interact(bb.expand2(vec2(48.0, 6.0)), ui.make_persistent_id("bend_ind"), Sense::hover());
+        p.text(pos2(bb.max.x, by - 12.0), Align2::RIGHT_CENTER, txt, FontId::proportional(10.5), MUTED);
+        bend_hover.on_hover_text("Pitch wheel. Ranges are set per instrument in Settings; the piano ignores it unless allowed there.");
     }
 
     fn keyboard(&mut self, ui: &mut egui::Ui, r: Rect) {
@@ -567,6 +895,9 @@ impl App {
         };
         // shadow + frame
         p.rect_filled(r.expand(6.0), CornerRadius::same(10), PANEL);
+        // keys outside the hardware keyboard's current span are drawn dimmer
+        let (span_lo, span_hi) = self.sounding_span();
+        let outside = |k: u8| (k as i32) < span_lo || (k as i32) > span_hi;
         let down = |k: u8| Params::key_is(&self.params.keys_down, k);
         let sounding = |k: u8| Params::key_is(&self.params.keys_sounding, k);
         for k in whites.iter().copied() {
@@ -578,6 +909,7 @@ impl App {
             } else {
                 KEY_WHITE
             };
+            let col = if outside(k) && !down(k) { lerp_color(col, BG, 0.42) } else { col };
             p.rect_filled(kr, CornerRadius { nw: 0, ne: 0, sw: 4, se: 4 }, col);
             if k % 12 == 0 {
                 p.text(pos2(kr.center().x, kr.max.y - 11.0), Align2::CENTER_CENTER, format!("C{}", k / 12 - 1), FontId::proportional(9.5), FAINT);
@@ -592,11 +924,21 @@ impl App {
             } else {
                 KEY_BLACK
             };
+            let col = if outside(k) && !down(k) { lerp_color(col, BG, 0.5) } else { col };
             p.rect_filled(kr.translate(vec2(0.0, 2.0)), CornerRadius { nw: 0, ne: 0, sw: 3, se: 3 }, Color32::from_black_alpha(70));
             p.rect_filled(kr, CornerRadius { nw: 0, ne: 0, sw: 3, se: 3 }, col);
         }
         // a thin felt strip
         p.rect_filled(Rect::from_min_size(r.min - vec2(0.0, 3.0), vec2(r.width(), 4.0)), CornerRadius::ZERO, Color32::from_rgb(0x5a, 0x24, 0x22));
+        // the hardware keyboard's span (inferred, plus the app's octave shift):
+        // dim the keys outside it and mark it with an amber bar
+        let lo_k = (span_lo.max(LO as i32)) as u8;
+        let hi_k = (span_hi.min(HI as i32)) as u8;
+        if lo_k <= hi_k {
+            let x0 = key_rect(lo_k).min.x;
+            let x1 = key_rect(hi_k).max.x;
+            p.rect_filled(Rect::from_min_max(pos2(x0, r.min.y - 5.0), pos2(x1, r.min.y - 1.0)), CornerRadius::same(2), ACCENT);
+        }
         // mouse playing
         let resp = ui.interact(r, ui.make_persistent_id("keyboard"), Sense::click_and_drag());
         let pointer_key = if resp.is_pointer_button_down_on() {
@@ -742,7 +1084,62 @@ impl App {
                 };
                 ui.label(egui::RichText::new(status).color(MUTED).size(12.5));
 
+                section(ui, "KEYBOARD");
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(110.0, 18.0), egui::Label::new(egui::RichText::new("Transpose").color(TEXT)));
+                    let mut tr = self.params.transpose.load(Ordering::Relaxed);
+                    if ui.add(egui::DragValue::new(&mut tr).range(-12..=12).suffix(" semitones")).changed() {
+                        self.params.transpose.store(tr, Ordering::Relaxed);
+                        self.dirty = true;
+                    }
+                    if ui.small_button("Reset").clicked() {
+                        self.params.transpose.store(0, Ordering::Relaxed);
+                        self.dirty = true;
+                    }
+                    ui.label(egui::RichText::new("Added to the octave shift (main screen); both apply to notes from the keyboard.").color(MUTED).size(12.0));
+                });
+
+                section(ui, "PITCH BEND");
+                for inst in InstrumentKind::ALL {
+                    let i = inst.id() as usize;
+                    ui.horizontal(|ui| {
+                        ui.add_sized(vec2(110.0, 18.0), egui::Label::new(egui::RichText::new(inst.label()).color(TEXT)));
+                        if inst == InstrumentKind::GrandPiano {
+                            let mut on = self.params.piano_bend.load(Ordering::Relaxed);
+                            if ui.checkbox(&mut on, "Allow (a real piano can't bend)").changed() {
+                                self.params.piano_bend.store(on, Ordering::Relaxed);
+                                self.dirty = true;
+                            }
+                            if !on {
+                                return;
+                            }
+                        }
+                        let mut up = self.params.bend_up[i].load(Ordering::Relaxed) as i32;
+                        let mut down = self.params.bend_down[i].load(Ordering::Relaxed) as i32;
+                        ui.label(egui::RichText::new("up").color(MUTED));
+                        let a = ui.add(egui::DragValue::new(&mut up).range(0..=12).suffix(" st"));
+                        ui.label(egui::RichText::new("down").color(MUTED));
+                        let b = ui.add(egui::DragValue::new(&mut down).range(0..=12).suffix(" st"));
+                        if a.changed() || b.changed() {
+                            self.params.bend_up[i].store(up as u8, Ordering::Relaxed);
+                            self.params.bend_down[i].store(down as u8, Ordering::Relaxed);
+                            self.dirty = true;
+                        }
+                        if ui.small_button("±2").clicked() {
+                            self.params.bend_up[i].store(2, Ordering::Relaxed);
+                            self.params.bend_down[i].store(2, Ordering::Relaxed);
+                            self.dirty = true;
+                        }
+                        if ui.small_button("up 2 / down 12").clicked() {
+                            self.params.bend_up[i].store(2, Ordering::Relaxed);
+                            self.params.bend_down[i].store(12, Ordering::Relaxed);
+                            self.dirty = true;
+                        }
+                    });
+                }
+
                 section(ui, "CONTROLLER MAPPING");
+                egui::ScrollArea::vertical().id_salt("mapping").max_height(250.0).show(ui, |ui| {
                 for t in Target::ALL {
                     let ccs = self.mapper.ccs_for(t);
                     ui.horizontal(|ui| {
@@ -759,6 +1156,7 @@ impl App {
                         }
                     });
                 }
+                });
                 ui.horizontal(|ui| {
                     if ui.button("Reset to Oxygen 49 defaults").clicked() {
                         self.mapper.reset_to_defaults();
@@ -799,6 +1197,7 @@ impl App {
                     ui.label(egui::RichText::new(format!("{} samples loaded · {} MB in memory · 16 velocity layers · release samples", i.samples.len(), i.memory_bytes / 1_000_000)).color(MUTED).size(12.0));
                 }
                 ui.label(egui::RichText::new("Shimmer (mod wheel): a stereo chorus whose depth and mix follow the wheel, with a gentle stereo tremolo in the top half.").color(MUTED).size(12.0));
+                ui.label(egui::RichText::new("Mono Synth and String Machine are synthesized in real time (no samples). On the synths, Tone is the filter cutoff and the mod wheel adds vibrato. \"Moog-style\" describes the kind of synth; this app has no connection with Moog Music.").color(MUTED).size(12.0));
                 ui.label(egui::RichText::new("Tips: drag or scroll a knob; Shift for fine; double-click to reset.").color(MUTED).size(12.0));
             });
         self.show_about = open;
@@ -807,21 +1206,48 @@ impl App {
 
 // ---------------------------------------------------------------- helpers
 
-fn default_of(t: Target, mode: VelocityMode) -> f32 {
+fn default_of(p: &Params, t: Target) -> f32 {
+    let inst = p.instrument();
+    let mono = &grand_piano::synth::MONO_PRESETS[p.preset_of(InstrumentKind::MonoSynth)];
     match t {
         Target::Volume => params::DEFAULT_VOLUME,
-        Target::Tone => params::DEFAULT_TONE,
+        Target::Tone => match inst {
+            InstrumentKind::GrandPiano => params::DEFAULT_TONE,
+            InstrumentKind::MonoSynth => mono.cutoff,
+            InstrumentKind::StringMachine => grand_piano::strings::STRING_PRESETS[p.preset_of(inst)].cutoff,
+        },
         Target::Reverb => params::DEFAULT_REVERB,
         Target::Modulation => params::DEFAULT_MOD,
-        Target::Touch if mode == VelocityMode::Fixed => (params::DEFAULT_FIXED - 1.0) / 126.0,
+        Target::Touch if p.mode() == VelocityMode::Fixed => (params::DEFAULT_FIXED - 1.0) / 126.0,
         Target::Touch => params::DEFAULT_TOUCH,
+        Target::Resonance => mono.resonance,
+        Target::Glide => mono.glide,
+        Target::Tempo => (params::DEFAULT_TEMPO - params::TEMPO_MIN) / (params::TEMPO_MAX - params::TEMPO_MIN),
         _ => 0.0,
     }
 }
 
 fn value_text(p: &Params, t: Target) -> String {
     let v = p.get_target(t);
+    let synth = p.instrument().is_synth();
     match t {
+        Target::Tone if synth => {
+            let hz = grand_piano::synth::cutoff_hz(v);
+            if hz >= 1000.0 { format!("{:.1} kHz", hz / 1000.0) } else { format!("{hz:.0} Hz") }
+        }
+        Target::Modulation if synth => if v < 0.005 { "off".into() } else { format!("{:.0}%", v * 100.0) },
+        Target::Resonance => if v >= 0.97 { "self-osc".into() } else { format!("{:.0}%", v * 100.0) },
+        Target::Glide => {
+            let secs = grand_piano::synth::glide_secs(v);
+            if p.preset_of(InstrumentKind::MonoSynth) == 2 {
+                "mono only".into()
+            } else if secs < 0.0005 {
+                "off".into()
+            } else {
+                format!("{:.0} ms", secs * 1000.0)
+            }
+        }
+        Target::Tempo => format!("{:.0} BPM", p.tempo_bpm()),
         Target::Volume => {
             let db = params::volume_db(v);
             if db.is_infinite() { "off".into() } else { format!("{db:+.1} dB") }
@@ -861,6 +1287,17 @@ fn arc(c: Pos2, r: f32, a0: f32, a1: f32, stroke: Stroke) -> Shape {
         c + vec2(a.cos(), a.sin()) * r
     }).collect();
     Shape::line(pts, stroke)
+}
+
+fn signed(v: i32) -> String {
+    if v > 0 { format!("+{v}") } else { v.to_string() }
+}
+
+/// MIDI note name with middle C (60) = C4.
+fn note_name(k: i32) -> String {
+    const N: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let k = k.clamp(0, 127);
+    format!("{}{}", N[(k % 12) as usize], k / 12 - 1)
 }
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -913,6 +1350,17 @@ fn pill_button(ui: &mut egui::Ui, r: Rect, text: &str, primary: bool) -> egui::R
     resp
 }
 
+/// An on/off pill: a dot that lights amber when on, and a label.
+fn toggle_pill(ui: &mut egui::Ui, r: Rect, text: &str, on: bool) -> egui::Response {
+    let resp = ui.interact(r, ui.make_persistent_id(("toggle", text)), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(r, CornerRadius::same((r.height() / 2.0) as u8), if resp.hovered() { LINE } else { RAISED });
+    let dot = pos2(r.min.x + 15.0, r.center().y);
+    p.circle_filled(dot, 4.5, if on { ACCENT } else { FAINT });
+    p.text(pos2(dot.x + 11.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), if on { TEXT } else { MUTED });
+    resp
+}
+
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(4.0);
     ui.label(egui::RichText::new(title).size(11.5).color(ACCENT).strong());
@@ -945,8 +1393,14 @@ pub fn style(ctx: &egui::Context) {
     ctx.set_visuals(v);
 }
 
-/// A small app icon: amber ring around three keys.
+/// The window/taskbar icon: assets/icon-256.png (the same artwork as the .ico
+/// embedded in the exe). Falls back to a drawn icon if it can't be decoded.
 pub fn icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_else(|_| drawn_icon())
+}
+
+/// A small drawn icon: amber ring around three keys.
+fn drawn_icon() -> egui::IconData {
     let n = 64usize;
     let mut rgba = vec![0u8; n * n * 4];
     for y in 0..n {
