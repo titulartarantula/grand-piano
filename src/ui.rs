@@ -63,6 +63,16 @@ pub struct App {
     dirty: bool,
     last_save: Instant,
     beat: BeatView,
+    shot: Option<Shot>,
+}
+
+/// `--screenshot OUT.png`: picture of the window once the piano is ready, then quit.
+struct Shot {
+    path: std::path::PathBuf,
+    started: Instant,
+    ready_at: Option<Instant>,
+    requested: bool,
+    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What the beat light shows: the newest beat the audio thread reported and the
@@ -75,7 +85,7 @@ struct BeatView {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> App {
+    pub fn new(cc: &eframe::CreationContext<'_>, shot: Option<std::path::PathBuf>) -> App {
         let ctx = cc.egui_ctx.clone();
         style(&ctx);
         let settings = Settings::load();
@@ -107,6 +117,10 @@ impl App {
             dirty: false,
             last_save: Instant::now(),
             beat: BeatView::default(),
+            shot: shot.map(|path| {
+                let _ = std::fs::remove_file(&path);
+                Shot { path, started: Instant::now(), ready_at: None, requested: false, done: Default::default() }
+            }),
         };
         app.start_loading(ctx);
         app
@@ -166,6 +180,10 @@ impl App {
     }
 
     fn save_now(&mut self) {
+        if self.shot.is_some() {
+            self.dirty = false; // a screenshot run leaves the settings alone
+            return;
+        }
         self.settings.capture(&self.params, &self.mapper);
         if let Err(e) = self.settings.save() {
             log::error!("saving settings: {e:#}");
@@ -216,7 +234,52 @@ impl App {
     }
 }
 
+impl App {
+    /// Drives a `--screenshot` run. Runs every frame, even when the window is hidden
+    /// or the session has no screen (egui then skips painting unless asked).
+    fn screenshot_step(&mut self, ctx: &egui::Context) {
+        let Some(s) = &mut self.shot else { return };
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        ctx.request_repaint_after(Duration::from_millis(50));
+        if s.done.load(Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if s.started.elapsed() > Duration::from_secs(300) {
+            log::error!("screenshot: gave up waiting for the piano to load");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if !matches!(self.phase, Phase::Ready) {
+            return;
+        }
+        let ready = *s.ready_at.get_or_insert_with(Instant::now);
+        // let the audio and MIDI status settle first
+        if !s.requested && ready.elapsed() > Duration::from_secs(2) {
+            s.requested = true;
+            let (path, done) = (s.path.clone(), s.done.clone());
+            ctx.request_screenshot(move |img| {
+                let [w, h] = img.size;
+                let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                match image::save_buffer(&path, &rgba, w as u32, h as u32, image::ColorType::Rgba8) {
+                    Ok(()) => log::info!("screenshot: saved {w}x{h} to {}", path.display()),
+                    Err(e) => log::error!("screenshot: {e}"),
+                }
+                done.store(true, Ordering::Relaxed);
+            });
+        }
+    }
+}
+
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.screenshot_step(ctx);
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        self.shot.is_none()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.tick();
         let ctx = ui.ctx().clone();

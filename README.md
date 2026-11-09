@@ -4,6 +4,10 @@ A simple, low-latency keyboard instrument for Windows and a USB MIDI keyboard.
 Plug in the keyboard, start the app, and play. It finds an M-Audio Oxygen
 automatically and maps its wheel, faders and knobs out of the box.
 
+![Grand Piano's main window: instrument tabs (Grand Piano, Moog-style Synth, String Machine, Electric Piano, Organ, Polysynth) with the Polysynth selected, its presets, six knobs (volume, cutoff, resonance, room, vibrato, touch), velocity modes, a metronome panel on the right and an 88-key keyboard along the bottom](docs/screenshot.png)
+
+**[Download the installer](https://github.com/titulartarantula/grand-piano/releases/latest)** (Windows 10/11, 64-bit).
+
 **What's in it**
 
 - **Six instruments:** a sampled **Grand Piano** (Salamander, 16 velocity
@@ -582,6 +586,8 @@ GrandPiano.exe --download-samples [--archive FILE]   fetch (or use a local copy)
 GrandPiano.exe --render-test [OUT.wav]    load the real samples, run the level/clip/click/silence checks, write a WAV;
                                           also renders and checks every synth preset
 GrandPiano.exe --synth-test               synth checks only (no samples or audio device needed)
+GrandPiano.exe --screenshot OUT.png       open the window, wait for the piano to load, save a PNG of it and quit
+                                          (doesn't save settings; used for docs/screenshot.png)
 ```
 
 Results are printed and also written to `%LOCALAPPDATA%\GrandPiano\selftest.txt`.

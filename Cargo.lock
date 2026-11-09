@@ -1202,6 +1202,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "hound",
+ "image",
  "log",
  "midir",
  "rayon",

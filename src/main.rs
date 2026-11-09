@@ -44,18 +44,29 @@ fn main() {
         std::process::exit(code);
     }
 
+    // --screenshot OUT.png: start normally, wait until the piano has loaded, save a
+    // picture of the window and quit (used for the README). It opens at the default
+    // size and doesn't save settings or the window position.
+    let shot = arg_after("--screenshot").map(std::path::PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Grand Piano")
             .with_inner_size([1180.0, 700.0])
             .with_min_inner_size([960.0, 620.0])
             .with_icon(std::sync::Arc::new(ui::icon())),
-        persist_window: true,
-        persistence_path: Some(grand_piano::settings::config_dir().join("window.ron")),
+        persist_window: shot.is_none(),
+        persistence_path: Some(match shot {
+            None => grand_piano::settings::config_dir().join("window.ron"),
+            Some(_) => std::env::temp_dir().join("grandpiano-screenshot-window.ron"),
+        }),
         ..Default::default()
     };
-    if let Err(e) = eframe::run_native("Grand Piano", options, Box::new(|cc| Ok(Box::new(ui::App::new(cc))))) {
+    let shot_path = shot.clone();
+    if let Err(e) = eframe::run_native("Grand Piano", options, Box::new(|cc| Ok(Box::new(ui::App::new(cc, shot))))) {
         log::error!("window: {e}");
+    }
+    if let Some(p) = shot_path {
+        std::process::exit(if p.is_file() { 0 } else { 1 });
     }
 }
 
