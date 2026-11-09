@@ -636,19 +636,63 @@ fortissimo clusters and pianissimo notes. It checks for clipping, clicks
 (second-difference detector), silence while keys are held, and that the tail
 decays. It writes `target/render-test.wav`.
 
-## Install (per-user, no admin)
+## Install
 
-Unzip the release folder, then run:
+Download `GrandPiano-Setup-<version>.exe` from the
+[latest release](https://github.com/titulartarantula/grand-piano/releases/latest)
+and run it. It installs for your Windows account only, so it doesn't ask for
+administrator rights:
+
+- the app goes in `%LOCALAPPDATA%\Programs\GrandPiano`;
+- a "Grand Piano" Start menu shortcut, and a desktop shortcut if you tick it;
+- an entry in **Settings > Apps > Installed apps**, where you can uninstall it.
+
+The setup program isn't code-signed, so Windows SmartScreen may warn about it
+the first time: click **More info**, then **Run anyway**.
+
+To upgrade, run a newer setup program over the old one. If Grand Piano is
+running, setup asks you to close it first. Your settings, MIDI mappings and
+downloaded samples are kept. Uninstalling keeps them too, unless you tick
+**Remove settings and samples** in the uninstaller.
+
+Unattended use: `GrandPiano-Setup-<version>.exe /S` installs silently (add
+`/DESKTOP` for the desktop shortcut). `uninstall.exe /S` in the install folder
+removes it silently (add `/PURGE` to remove settings and samples too). Silent
+setup exits with code 2 if Grand Piano is running.
+
+If you installed an earlier build with `install.ps1`, just run the setup
+program: it installs into the same folder, replaces the old files and adds the
+uninstaller and the Installed apps entry.
+
+### Building the installer
+
+The setup program is made with [NSIS](https://nsis.sourceforge.io/), which runs
+on Linux, so the whole release builds on one machine:
+
+```
+sudo apt install nsis                 # NSIS 3
+packaging/build-installer.sh          # builds the exe, then dist/GrandPiano-Setup-<version>.exe
+```
+
+The version comes from `Cargo.toml`. The script writes a `.sha256` file next to
+the installer. The installer script itself is `packaging/installer.nsi`.
+
+### Without the installer (scripts)
+
+`packaging/install.ps1` and `packaging/uninstall.ps1` still work for a quick
+install from a build folder (for example while testing a new build). They
+install to the same folder with the same Start menu shortcut, but don't add an
+Installed apps entry. Put them next to `GrandPiano.exe`, `GrandPiano.ico`,
+`README.md` and `LICENSE-SAMPLES.txt`, then run:
 
 ```
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-This installs to `%LOCALAPPDATA%\Programs\GrandPiano` and adds a Start menu
-shortcut called "Grand Piano" with the app icon. If Grand Piano is running, the
-installer stops and asks you to close it first (`-Force` closes it for you).
-Settings and samples are kept. `uninstall.ps1` removes it; `-All` also removes
-the settings and samples.
+If Grand Piano is running, the script stops and asks you to close it first
+(`-Force` closes it for you). `uninstall.ps1` removes it; `-All` also removes
+the settings and samples. Don't mix the two methods: if you used the setup
+program, uninstall from Installed apps.
 
 ## Code layout
 
@@ -667,6 +711,7 @@ the settings and samples.
 | `src/settings.rs`, `src/download.rs` | JSON settings, checksum-verified sample download |
 | `src/analysis.rs` | offline render and audio checks |
 | `src/audio_win.rs`, `src/midi.rs`, `src/ui.rs`, `src/main.rs` | Windows app: WASAPI, midir, egui |
+| `packaging/installer.nsi`, `packaging/build-installer.sh` | the Windows setup program (NSIS) |
 
 ## Icon
 
