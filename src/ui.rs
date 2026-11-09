@@ -326,17 +326,29 @@ impl App {
         let left = Rect::from_min_max(mid.min, pos2(metro.min.x - 14.0, mid.max.y));
         ui.painter().rect_filled(left, CornerRadius::same(18), PANEL);
         ui.painter().rect_filled(metro, CornerRadius::same(18), PANEL);
-        // the Moog-style synth gets a second row for its Voices switch
-        let strip_h = if self.params.instrument() == InstrumentKind::MonoSynth { 108.0 } else { 72.0 };
+        // instruments with presets get a second row (presets, Voices / Leslie switch)
+        let inst = self.params.instrument();
+        let strip_h = if inst.presets().is_empty() { 60.0 } else { 100.0 };
         let strip = Rect::from_min_size(left.min, vec2(left.width(), strip_h));
         self.instrument_strip(ui, strip);
         let row_h = 104.0;
-        let knob_area = Rect::from_min_max(pos2(left.min.x, strip.max.y), pos2(left.max.x, (left.max.y - row_h).max(strip.max.y + 120.0)));
-        let targets: &[Target] = match self.params.instrument() {
+        let mut knob_area = Rect::from_min_max(pos2(left.min.x, strip.max.y), pos2(left.max.x, (left.max.y - row_h).max(strip.max.y + 120.0)));
+        let targets: &[Target] = match inst {
             InstrumentKind::GrandPiano => &[Target::Volume, Target::Tone, Target::Reverb, Target::Modulation, Target::Touch],
             InstrumentKind::MonoSynth => &[Target::Volume, Target::Tone, Target::Resonance, Target::Glide, Target::Reverb, Target::Modulation, Target::Touch],
-            InstrumentKind::StringMachine => &[Target::Volume, Target::Tone, Target::Reverb, Target::Modulation, Target::Touch],
+            InstrumentKind::StringMachine | InstrumentKind::ElectricPiano => &[Target::Volume, Target::Tone, Target::Reverb, Target::Modulation, Target::Touch],
+            // the organ has no velocity (Touch) and its wheel is the Leslie switch above
+            InstrumentKind::Organ => &[Target::Volume, Target::Tone, Target::Reverb],
+            InstrumentKind::Polysynth => &[Target::Volume, Target::Tone, Target::Resonance, Target::Reverb, Target::Modulation, Target::Touch],
         };
+        if inst == InstrumentKind::Organ {
+            // the drawbars take the right part of the knob row
+            let split = knob_area.min.x + knob_area.width() * 0.44;
+            let bars = Rect::from_min_max(pos2(split, knob_area.min.y + 4.0), pos2(knob_area.max.x - 16.0, knob_area.max.y - 4.0));
+            ui.painter().rect_filled(bars, CornerRadius::same(12), Color32::from_rgb(0x19, 0x16, 0x12));
+            self.drawbar_panel(ui, bars);
+            knob_area.max.x = split;
+        }
         let w = knob_area.width() / targets.len() as f32;
         for (i, t) in targets.iter().enumerate() {
             let r = Rect::from_min_size(pos2(knob_area.min.x + w * i as f32, knob_area.min.y), vec2(w, knob_area.height()));
@@ -413,114 +425,200 @@ impl App {
         (lo + s, hi + s)
     }
 
-    /// Instrument selector (left) and preset selector (right), each with a MIDI-learn chip.
+    /// Two rows: the instrument selector across the top (with its MIDI-learn
+    /// chip), then the preset selector and, on the Moog-style Synth and the
+    /// Organ, their Voices / Leslie switch.
     fn instrument_strip(&mut self, ui: &mut egui::Ui, r: Rect) {
         let p = ui.painter().clone();
         let cur = self.params.instrument();
-        let h = 34.0;
-        let y = r.min.y + 14.0;
         let pad = 20.0;
-        let seg = ((r.width() * 0.56) / 3.0).clamp(88.0, 128.0);
-        let total = Rect::from_min_size(pos2(r.min.x + pad, y), vec2(seg * 3.0, h));
-        p.rect_filled(total, CornerRadius::same(17), RAISED);
+        let chip_w = 74.0;
+        // ---- row 1: instruments
+        let h = 32.0;
+        let y = r.min.y + 12.0;
+        let n = InstrumentKind::ALL.len() as f32;
+        let seg = ((r.width() - 2.0 * pad - chip_w - 10.0) / n).min(132.0);
+        let total = Rect::from_min_size(pos2(r.min.x + pad, y), vec2(seg * n, h));
+        p.rect_filled(total, CornerRadius::same(16), RAISED);
         for (i, k) in InstrumentKind::ALL.iter().enumerate() {
             let sr = Rect::from_min_size(pos2(total.min.x + seg * i as f32, total.min.y), vec2(seg, h));
             let resp = ui.interact(sr, ui.make_persistent_id(("inst", i)), Sense::click());
             let sel = *k == cur;
             if sel {
-                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), ACCENT);
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(13), ACCENT);
             } else if resp.hovered() {
-                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), LINE);
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(13), LINE);
             }
-            // shrink the label if it doesn't fit the segment (narrow windows)
-            let mut size = 14.0;
-            while size > 11.0 && p.layout_no_wrap(k.label().to_string(), FontId::proportional(size), TEXT).size().x > seg - 12.0 {
-                size -= 0.5;
-            }
-            p.text(sr.center(), Align2::CENTER_CENTER, k.label(), FontId::proportional(size), if sel { BG } else { TEXT });
+            // narrow window: a short name if the full one doesn't fit
+            let name = if p.layout_no_wrap(k.label().to_string(), FontId::proportional(10.5), TEXT).size().x > seg - 10.0 { short_label(*k) } else { k.label() };
+            let size = fit_size(&p, name, 13.5, 10.5, seg - 10.0);
+            p.text(sr.center(), Align2::CENTER_CENTER, name, FontId::proportional(size), if sel { BG } else { TEXT });
             if resp.clicked() {
                 self.params.set_instrument(*k);
                 self.dirty = true;
             }
             resp.on_hover_text(k.description());
         }
-        self.mapping_chip(ui, pos2(total.center().x, total.max.y + 15.0), Target::Instrument);
-        if cur == InstrumentKind::MonoSynth {
-            self.voices_row(ui, Rect::from_min_max(pos2(r.min.x + pad, r.min.y + 76.0), pos2(r.max.x - pad, r.min.y + 106.0)));
-        }
+        self.mapping_chip(ui, pos2(total.max.x + 10.0 + chip_w / 2.0, total.center().y), Target::Instrument);
+        // ---- row 2: presets (left) and the instrument's switch (right)
         let names = cur.presets();
         if names.is_empty() {
             return;
         }
-        let n = names.len() as f32;
-        let ps = ((r.width() * 0.36) / n).clamp(60.0, 92.0);
-        let ptotal = Rect::from_min_size(pos2(r.max.x - pad - ps * n, y), vec2(ps * n, h));
-        if ptotal.min.x - 70.0 > total.max.x {
-            spaced(&p, pos2(ptotal.min.x - 12.0, ptotal.center().y), "PRESET", 11.0, MUTED, Align2::RIGHT_CENTER);
+        let h2 = 30.0;
+        let cy = total.max.y + 12.0 + h2 / 2.0;
+        // the switch on the right, laid out right to left: [chip] [A|B] LABEL
+        let switch: Option<(&str, [&str; 2], usize, Target)> = match cur {
+            InstrumentKind::MonoSynth => Some(("VOICES", ["Poly", "Mono"], self.params.voice_mode().id() as usize, Target::Voices)),
+            InstrumentKind::Organ => Some(("LESLIE", ["Slow", "Fast"], self.params.leslie_fast.load(Ordering::Relaxed) as usize, Target::Leslie)),
+            _ => None,
+        };
+        let mut right = r.max.x - pad;
+        if let Some((label, opts, sel_idx, target)) = switch {
+            self.mapping_chip(ui, pos2(right - chip_w / 2.0, cy), target);
+            right -= chip_w + 8.0;
+            let sw = 64.0;
+            let st = Rect::from_min_size(pos2(right - sw * 2.0, cy - h2 / 2.0), vec2(sw * 2.0, h2));
+            p.rect_filled(st, CornerRadius::same(15), RAISED);
+            for (i, o) in opts.iter().enumerate() {
+                let sr = Rect::from_min_size(pos2(st.min.x + sw * i as f32, st.min.y), vec2(sw, h2));
+                let resp = ui.interact(sr, ui.make_persistent_id(("switch", label, i)), Sense::click());
+                let sel = i == sel_idx;
+                if sel {
+                    p.rect_filled(sr.shrink(3.0), CornerRadius::same(12), ACCENT);
+                } else if resp.hovered() {
+                    p.rect_filled(sr.shrink(3.0), CornerRadius::same(12), LINE);
+                }
+                p.text(sr.center(), Align2::CENTER_CENTER, *o, FontId::proportional(13.5), if sel { BG } else { TEXT });
+                if resp.clicked() {
+                    match target {
+                        Target::Voices => self.params.set_voice_mode(VoiceMode::ALL[i]),
+                        _ => self.params.leslie_fast.store(i == 1, Ordering::Relaxed),
+                    }
+                    self.dirty = true;
+                }
+                resp.on_hover_text(match (target, i) {
+                    (Target::Voices, 0) => "Poly: up to 8 notes at once, so chords work. Glide is off.",
+                    (Target::Voices, _) => match self.params.note_priority() {
+                        NotePriority::Last => "Mono: one note at a time, legato, with glide. The last key pressed wins (Note priority is in Settings).",
+                        NotePriority::High => "Mono: one note at a time, legato, with glide. The highest held key wins (Note priority is in Settings).",
+                        NotePriority::Low => "Mono: one note at a time, legato, with glide. The lowest held key wins (Note priority is in Settings).",
+                    },
+                    (_, 0) => "Slow (chorale). The mod wheel switches too: below half = slow, above = fast.",
+                    _ => "Fast (tremolo). The horn gets up to speed in about a second, the heavier drum in a few.",
+                });
+            }
+            spaced(&p, pos2(st.min.x - 10.0, cy), label, 11.0, MUTED, Align2::RIGHT_CENTER);
+            right = st.min.x - 10.0 - 64.0 - 16.0;
         }
-        p.rect_filled(ptotal, CornerRadius::same(17), RAISED);
+        // presets: PRESET [a|b|c] [chip]
+        let left = r.min.x + pad;
+        let label_w = 62.0;
+        let n = names.len() as f32;
+        let ps = ((right - left - label_w - chip_w - 10.0) / n).clamp(44.0, 118.0);
+        let ptotal = Rect::from_min_size(pos2(left + label_w, cy - h2 / 2.0), vec2(ps * n, h2));
+        spaced(&p, pos2(left, cy), "PRESET", 11.0, MUTED, Align2::LEFT_CENTER);
+        p.rect_filled(ptotal, CornerRadius::same(15), RAISED);
         let sel_idx = self.params.preset_of(cur);
         for (i, name) in names.iter().enumerate() {
-            let sr = Rect::from_min_size(pos2(ptotal.min.x + ps * i as f32, ptotal.min.y), vec2(ps, h));
+            let sr = Rect::from_min_size(pos2(ptotal.min.x + ps * i as f32, ptotal.min.y), vec2(ps, h2));
             let resp = ui.interact(sr, ui.make_persistent_id(("preset", i)), Sense::click());
             let sel = i == sel_idx;
-            if sel {
-                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), ACCENT);
-            } else if resp.hovered() {
-                p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), LINE);
-            }
-            p.text(sr.center(), Align2::CENTER_CENTER, *name, FontId::proportional(14.0), if sel { BG } else { TEXT });
-            if resp.clicked() {
-                self.params.select_preset(cur, i);
-                self.dirty = true;
-            }
-        }
-        self.mapping_chip(ui, pos2(ptotal.center().x, ptotal.max.y + 15.0), Target::Preset);
-    }
-
-    /// The Moog-style synth's Voices switch: Poly (chords) / Mono (one note,
-    /// legato, glide), with its MIDI-learn chip and a one-line explanation.
-    fn voices_row(&mut self, ui: &mut egui::Ui, r: Rect) {
-        let p = ui.painter().clone();
-        let cy = r.center().y;
-        spaced(&p, pos2(r.min.x, cy), "VOICES", 11.0, MUTED, Align2::LEFT_CENTER);
-        let seg = 78.0;
-        let total = Rect::from_min_size(pos2(r.min.x + 64.0, r.min.y), vec2(seg * 2.0, r.height()));
-        p.rect_filled(total, CornerRadius::same(15), RAISED);
-        let cur = self.params.voice_mode();
-        for (i, m) in VoiceMode::ALL.iter().enumerate() {
-            let sr = Rect::from_min_size(pos2(total.min.x + seg * i as f32, total.min.y), vec2(seg, r.height()));
-            let resp = ui.interact(sr, ui.make_persistent_id(("voices", i)), Sense::click());
-            let sel = *m == cur;
             if sel {
                 p.rect_filled(sr.shrink(3.0), CornerRadius::same(12), ACCENT);
             } else if resp.hovered() {
                 p.rect_filled(sr.shrink(3.0), CornerRadius::same(12), LINE);
             }
-            p.text(sr.center(), Align2::CENTER_CENTER, m.label(), FontId::proportional(14.0), if sel { BG } else { TEXT });
+            let size = fit_size(&p, name, 13.5, 10.0, ps - 8.0);
+            p.text(sr.center(), Align2::CENTER_CENTER, *name, FontId::proportional(size), if sel { BG } else { TEXT });
             if resp.clicked() {
-                self.params.set_voice_mode(*m);
+                self.params.select_preset(cur, i);
                 self.dirty = true;
             }
-            resp.on_hover_text(match m {
-                VoiceMode::Poly => "Poly: up to 8 notes at once, so chords work. Glide is off.",
-                VoiceMode::Mono => "Mono: one note at a time, legato, with glide. Which held key sounds is set by Note priority in Settings.",
-            });
+            resp.on_hover_text(preset_hint(cur, i));
         }
-        let chip_x = total.max.x + 44.0;
-        self.mapping_chip(ui, pos2(chip_x, cy), Target::Voices);
-        let hint = match cur {
-            VoiceMode::Poly => "Chords: every key sounds.",
-            VoiceMode::Mono => match self.params.note_priority() {
-                NotePriority::Last => "One note: the last key pressed wins (legato, glide).",
-                NotePriority::High => "One note: the highest held key wins (legato, glide).",
-                NotePriority::Low => "One note: the lowest held key wins (legato, glide).",
-            },
-        };
-        let tx = chip_x + 50.0;
-        if tx + 120.0 < r.max.x {
-            let g = p.layout(hint.to_string(), FontId::proportional(12.5), MUTED, r.max.x - tx);
-            p.galley(pos2(tx, cy - g.size().y / 2.0), g, MUTED);
+        self.mapping_chip(ui, pos2(ptotal.max.x + 10.0 + chip_w / 2.0, cy), Target::Preset);
+    }
+
+    /// The organ's drawbars (pull down = louder, 0..8, coloured like the
+    /// original: brown sub-octaves, white octaves, black mutations) and its
+    /// percussion switches. Drag or scroll a bar; double-click resets it to the preset.
+    fn drawbar_panel(&mut self, ui: &mut egui::Ui, r: Rect) {
+        let p = ui.painter().clone();
+        let inner = r.shrink2(vec2(14.0, 10.0));
+        let reg: String = self.params.drawbars.iter().map(|d| char::from(b'0' + d.load(Ordering::Relaxed).min(8))).collect();
+        spaced(&p, pos2(inner.min.x, inner.min.y + 14.0), "DRAWBARS", 11.0, MUTED, Align2::LEFT_CENTER);
+        p.text(pos2(inner.max.x, inner.min.y + 14.0), Align2::RIGHT_CENTER, &reg, FontId::monospace(13.0), TEXT);
+        let perc_h = 30.0;
+        let top = inner.min.y + 34.0;
+        let bottom = inner.max.y - perc_h - 10.0;
+        let slot_h = (bottom - top - 16.0).max(40.0);
+        let cw = inner.width() / 9.0;
+        let preset = grand_piano::organ::ORGAN_PRESETS[self.params.preset_of(InstrumentKind::Organ)];
+        for d in 0..9 {
+            let cx = inner.min.x + cw * (d as f32 + 0.5);
+            let slot = Rect::from_min_max(pos2(cx - 4.0, top), pos2(cx + 4.0, top + slot_h));
+            p.rect_filled(slot, CornerRadius::same(3), RAISED);
+            let val = self.params.drawbars[d].load(Ordering::Relaxed).min(8);
+            let len = slot_h * val as f32 / 8.0;
+            let (fill, ink) = match d {
+                0 | 1 => (Color32::from_rgb(0x7a, 0x47, 0x2b), TEXT),
+                4 | 6 | 7 => (KEY_BLACK, TEXT),
+                _ => (KEY_WHITE, BG),
+            };
+            if val > 0 {
+                p.rect_filled(Rect::from_min_max(pos2(cx - 3.0, top), pos2(cx + 3.0, top + len)), CornerRadius::same(2), FAINT);
+            }
+            let handle = Rect::from_center_size(pos2(cx, top + len), vec2((cw - 8.0).clamp(14.0, 28.0), 16.0));
+            p.rect(handle, CornerRadius::same(4), fill, Stroke::new(1.0, LINE), StrokeKind::Inside);
+            p.text(handle.center(), Align2::CENTER_CENTER, val.to_string(), FontId::proportional(11.0), ink);
+            p.text(pos2(cx, top + slot_h + 12.0), Align2::CENTER_CENTER, grand_piano::organ::DRAWBAR_NAMES[d], FontId::proportional(10.5), MUTED);
+            let hit = Rect::from_min_max(pos2(cx - cw / 2.0, top - 8.0), pos2(cx + cw / 2.0, top + slot_h + 8.0));
+            let resp = ui.interact(hit, ui.make_persistent_id(("drawbar", d)), Sense::click_and_drag());
+            let mut nv = val as i32;
+            if resp.is_pointer_button_down_on() {
+                if let Some(pp) = resp.interact_pointer_pos() {
+                    nv = (((pp.y - top) / slot_h) * 8.0).round() as i32;
+                }
+            }
+            if resp.hovered() {
+                let s = ui.input(|i| i.smooth_scroll_delta.y);
+                if s.abs() > 0.5 {
+                    nv -= s.signum() as i32;
+                }
+            }
+            if resp.double_clicked() {
+                nv = preset.drawbars[d] as i32;
+            }
+            let nv = nv.clamp(0, 8) as u8;
+            if nv != val {
+                self.params.drawbars[d].store(nv, Ordering::Relaxed);
+                self.dirty = true;
+            }
+            resp.on_hover_text(format!("{} drawbar: {val} of 8. Drag or scroll; double-click for the preset's value.", grand_piano::organ::DRAWBAR_NAMES[d]));
+        }
+        // percussion switches
+        let py = inner.max.y - perc_h;
+        let pw = (inner.width() - 18.0) / 4.0;
+        let flags = [
+            (&self.params.perc_on, "Perc", "Percussion: a decaying 2nd or 3rd harmonic on the attack, single-triggered (only when no other key is held). Turns the 1' drawbar off, as on the original."),
+            (&self.params.perc_third, "3rd", "On: 3rd harmonic (2⅔'). Off: 2nd harmonic (4')."),
+            (&self.params.perc_soft, "Soft", "Soft percussion (quieter). Normal volume also lowers the drawbars about 3 dB, as on the original."),
+            (&self.params.perc_fast, "Fast", "Fast decay (about half a second). Off: slow (about 2 s)."),
+        ];
+        let mut toggled = None;
+        for (i, (flag, label, tip)) in flags.iter().enumerate() {
+            let on = flag.load(Ordering::Relaxed);
+            let rr = Rect::from_min_size(pos2(inner.min.x + (pw + 6.0) * i as f32, py), vec2(pw, perc_h - 2.0));
+            let resp = toggle_pill(ui, rr, label, on);
+            if resp.clicked() {
+                toggled = Some(i);
+            }
+            resp.on_hover_text(*tip);
+        }
+        if let Some(i) = toggled {
+            flags[i].0.fetch_xor(true, Ordering::Relaxed);
+            self.dirty = true;
         }
     }
 
@@ -756,16 +854,23 @@ impl App {
 
     fn knob(&mut self, ui: &mut egui::Ui, area: Rect, t: Target) {
         let mode = self.params.mode();
-        let synth = self.params.instrument().is_synth();
+        let inst = self.params.instrument();
         let label = match t {
             Target::Touch if mode == VelocityMode::Fixed => "LEVEL",
             Target::Touch => "TOUCH",
             Target::Volume => "VOLUME",
-            Target::Tone if synth => "CUTOFF",
-            Target::Tone => "TONE",
+            Target::Tone => match inst {
+                InstrumentKind::GrandPiano | InstrumentKind::ElectricPiano => "TONE",
+                InstrumentKind::Organ => "DRIVE",
+                _ => "CUTOFF",
+            },
             Target::Reverb => "ROOM",
-            Target::Modulation if synth => "VIBRATO",
-            Target::Modulation => "SHIMMER",
+            Target::Modulation => match inst {
+                InstrumentKind::GrandPiano => "SHIMMER",
+                InstrumentKind::ElectricPiano => "TREMOLO",
+                InstrumentKind::Organ => "LESLIE",
+                _ => "VIBRATO",
+            },
             Target::Resonance => "RESONANCE",
             Target::Glide => "GLIDE",
             Target::Tempo => "TEMPO",
@@ -854,12 +959,14 @@ impl App {
                 self.dirty = true;
             }
         }
+        let organ = !self.params.instrument().velocity_sensitive();
         let desc = match mode {
+            _ if organ => "Organ keys are on/off: velocity doesn't change the sound. The mode applies to the other instruments.",
             VelocityMode::Normal => "Standard response: play hard for loud. Touch knob shapes the curve.",
             VelocityMode::Light => "Soft playing still sounds full. Touch knob sets how light.",
             VelocityMode::Fixed => "Every note at the same level. The Level knob sets it.",
         };
-        p.text(pos2(total.center().x, total.max.y + 16.0), Align2::CENTER_CENTER, desc, FontId::proportional(12.5), MUTED);
+        p.text(pos2(total.center().x, total.max.y + 16.0), Align2::CENTER_CENTER, desc, FontId::proportional(12.5), if organ { ACCENT } else { MUTED });
         self.mapping_chip(ui, pos2(total.center().x, total.max.y + 42.0), Target::VelocityMode);
 
         // left: output meter, voices, last velocity
@@ -1181,6 +1288,7 @@ impl App {
                 });
 
                 section(ui, "PITCH BEND");
+                ui.label(egui::RichText::new("Semitones up and down per instrument; 0 = off. The organ's is off by default, like the original.").color(MUTED).size(12.0));
                 for inst in InstrumentKind::ALL {
                     let i = inst.id() as usize;
                     ui.horizontal(|ui| {
@@ -1278,7 +1386,7 @@ impl App {
                     ui.label(egui::RichText::new(format!("{} samples loaded · {} MB in memory · 16 velocity layers · release samples", i.samples.len(), i.memory_bytes / 1_000_000)).color(MUTED).size(12.0));
                 }
                 ui.label(egui::RichText::new("Shimmer (mod wheel): a stereo chorus whose depth and mix follow the wheel, with a gentle stereo tremolo in the top half.").color(MUTED).size(12.0));
-                ui.label(egui::RichText::new("The Moog-style Synth and String Machine are synthesized in real time (no samples). On the synths, Tone is the filter cutoff and the mod wheel adds vibrato. The Moog-style Synth plays chords in Poly; switch Voices to Mono for one-note legato and glide. \"Moog-style\" describes the kind of synth; this app has no connection with Moog Music.").color(MUTED).size(12.0));
+                ui.label(egui::RichText::new("The Moog-style Synth, String Machine, Electric Piano, Organ and Polysynth are synthesized in real time (no samples). On the synths, Tone is the filter cutoff and the mod wheel adds vibrato; on the Electric Piano, Tone is brightness and the wheel is tremolo; on the Organ, Tone is drive and the wheel switches the rotating speaker between slow and fast. Names such as Moog, Rhodes, Wurlitzer, Hammond, B3, Leslie, Juno, Prophet and Oberheim only describe the kind of instrument; this app has no connection with their makers, and the names are their owners' trademarks.").color(MUTED).size(12.0));
                 ui.label(egui::RichText::new("Tips: drag or scroll a knob; Shift for fine; double-click to reset.").color(MUTED).size(12.0));
             });
         self.show_about = open;
@@ -1290,17 +1398,22 @@ impl App {
 fn default_of(p: &Params, t: Target) -> f32 {
     let inst = p.instrument();
     let mono = &grand_piano::synth::MONO_PRESETS[p.preset_of(InstrumentKind::MonoSynth)];
+    let poly = &grand_piano::poly::POLY_PRESETS[p.preset_of(InstrumentKind::Polysynth)];
     match t {
         Target::Volume => params::DEFAULT_VOLUME,
         Target::Tone => match inst {
             InstrumentKind::GrandPiano => params::DEFAULT_TONE,
             InstrumentKind::MonoSynth => mono.cutoff,
             InstrumentKind::StringMachine => grand_piano::strings::STRING_PRESETS[p.preset_of(inst)].cutoff,
+            InstrumentKind::ElectricPiano => grand_piano::ep::EP_PRESETS[p.preset_of(inst)].tone,
+            InstrumentKind::Organ => grand_piano::organ::ORGAN_PRESETS[p.preset_of(inst)].drive,
+            InstrumentKind::Polysynth => poly.cutoff,
         },
         Target::Reverb => params::DEFAULT_REVERB,
         Target::Modulation => params::DEFAULT_MOD,
         Target::Touch if p.mode() == VelocityMode::Fixed => (params::DEFAULT_FIXED - 1.0) / 126.0,
         Target::Touch => params::DEFAULT_TOUCH,
+        Target::Resonance if inst == InstrumentKind::Polysynth => poly.resonance,
         Target::Resonance => mono.resonance,
         Target::Glide => mono.glide,
         Target::Tempo => (params::DEFAULT_TEMPO - params::TEMPO_MIN) / (params::TEMPO_MAX - params::TEMPO_MIN),
@@ -1310,8 +1423,12 @@ fn default_of(p: &Params, t: Target) -> f32 {
 
 fn value_text(p: &Params, t: Target) -> String {
     let v = p.get_target(t);
-    let synth = p.instrument().is_synth();
+    let inst = p.instrument();
+    let synth = inst.is_synth();
     match t {
+        Target::Tone if inst == InstrumentKind::ElectricPiano => format!("{:.0}%", v * 100.0),
+        Target::Tone if inst == InstrumentKind::Organ => if v < 0.005 { "clean".into() } else { format!("{:.0}%", v * 100.0) },
+        Target::Modulation if inst == InstrumentKind::Organ => if p.leslie_fast.load(Ordering::Relaxed) { "fast".into() } else { "slow".into() },
         Target::Tone if synth => {
             let hz = grand_piano::synth::cutoff_hz(v);
             if hz >= 1000.0 { format!("{:.1} kHz", hz / 1000.0) } else { format!("{hz:.0} Hz") }
@@ -1368,6 +1485,51 @@ fn arc(c: Pos2, r: f32, a0: f32, a1: f32, stroke: Stroke) -> Shape {
         c + vec2(a.cos(), a.sin()) * r
     }).collect();
     Shape::line(pts, stroke)
+}
+
+/// The largest font size from `max` down to `min` (0.5 steps) at which `text` fits in `width`.
+fn fit_size(p: &egui::Painter, text: &str, max: f32, min: f32, width: f32) -> f32 {
+    let mut size = max;
+    while size > min && p.layout_no_wrap(text.to_string(), FontId::proportional(size), TEXT).size().x > width {
+        size -= 0.5;
+    }
+    size
+}
+
+fn short_label(k: InstrumentKind) -> &'static str {
+    match k {
+        InstrumentKind::GrandPiano => "Piano",
+        InstrumentKind::MonoSynth => "Moog-style",
+        InstrumentKind::StringMachine => "Strings",
+        InstrumentKind::ElectricPiano => "E-Piano",
+        InstrumentKind::Organ => "Organ",
+        InstrumentKind::Polysynth => "Polysynth",
+    }
+}
+
+/// One line about each preset, for the preset buttons' tooltips.
+fn preset_hint(inst: InstrumentKind, i: usize) -> &'static str {
+    match (inst, i) {
+        (InstrumentKind::MonoSynth, 0) => "Bass: punchy saws with a square sub-octave and a short filter snap.",
+        (InstrumentKind::MonoSynth, 1) => "Lead: saw, square and an octave-up saw, with glide (in Mono).",
+        (InstrumentKind::MonoSynth, _) => "Poly: two detuned saws and a triangle sub, slower envelopes.",
+        (InstrumentKind::StringMachine, 0) => "Strings: bright 8' + 4' ensemble.",
+        (InstrumentKind::StringMachine, 1) => "Phased: the ensemble through a slow phaser.",
+        (InstrumentKind::StringMachine, _) => "Dark: 16' + 8', slower attack, lower cutoff.",
+        (InstrumentKind::ElectricPiano, 0) => "Suitcase: warm tine piano with stereo autopan (wheel). Barks when you dig in.",
+        (InstrumentKind::ElectricPiano, 1) => "Bright Tines: bell-like tine attack with a little FM-piano sparkle. Stereo autopan (wheel).",
+        (InstrumentKind::ElectricPiano, _) => "Wurli: reedy, nasal reed piano that growls when played hard. Mono tremolo (wheel).",
+        (InstrumentKind::Organ, 0) => "Jazz: drawbars 888000000, no percussion.",
+        (InstrumentKind::Organ, 1) => "Gospel: 888800000 with 3rd-harmonic percussion.",
+        (InstrumentKind::Organ, 2) => "Rock: all drawbars out (888888888), overdriven.",
+        (InstrumentKind::Organ, _) => "Ballad: soft flutes (008800000), clean.",
+        (InstrumentKind::Polysynth, 0) => "80s Pad: Juno-style saw + PWM pulse + sub, slow attack, chorus II.",
+        (InstrumentKind::Polysynth, 1) => "Brass Stab: Prophet-style two saws with a snappy filter and a touch of poly-mod.",
+        (InstrumentKind::Polysynth, 2) => "Synthwave Lead: Prophet-style saw + square an octave up, resonant, chorus I.",
+        (InstrumentKind::Polysynth, 3) => "Juno Strings: PWM pulse ensemble through the Juno-style chorus I.",
+        (InstrumentKind::Polysynth, _) => "OB Brass: Oberheim-style fat detuned saws through a 12 dB filter.",
+        _ => "",
+    }
 }
 
 fn signed(v: i32) -> String {

@@ -427,10 +427,15 @@ pub struct SynthLevelRow {
     pub rms_db: f32,
 }
 
+/// The real-time (non-sampled) instruments.
+pub fn synth_instruments() -> impl Iterator<Item = InstrumentKind> {
+    InstrumentKind::ALL.into_iter().filter(|i| i.is_synth())
+}
+
 pub fn synth_level_report(sr: u32) -> Vec<SynthLevelRow> {
     let piano = no_piano();
     let mut rows = Vec::new();
-    for inst in [InstrumentKind::MonoSynth, InstrumentKind::StringMachine] {
+    for inst in synth_instruments() {
         for preset in 0..inst.presets().len() {
             for &voices in voice_modes(inst) {
                 for mode in [VelocityMode::Light, VelocityMode::Normal] {
@@ -614,22 +619,38 @@ impl ChordRow {
 /// the whole engine, so a limiter or any shared stage that ducked the held
 /// notes would show up here.
 pub fn chord_check(piano: Arc<Instrument>, sr: u32, preset: usize) -> ChordRow {
+    chord_check_on(piano, sr, InstrumentKind::MonoSynth, preset)
+}
+
+/// `chord_check` on any real-time instrument. On the electric piano (whose
+/// notes decay) all four keys are struck together; elsewhere C2 comes in
+/// 0.5 s after the triad. The new instruments are measured over 4 s instead
+/// of 2, so partials of C2 that nearly coincide with an upper note (C2's 6th
+/// harmonic is 0.4 Hz from G4) are averaged over a whole beat.
+pub fn chord_check_on(piano: Arc<Instrument>, sr: u32, inst: InstrumentKind, preset: usize) -> ChordRow {
     const KEYS: [u8; 4] = [36, 60, 64, 67];
+    let together = inst == InstrumentKind::ElectricPiano;
+    let window = if inst == InstrumentKind::MonoSynth { 2 } else { 4 };
     let mut renders = Vec::new();
     let mut limiter = 0f32;
     for with_low in [false, true] {
-        let mut e = synth_engine(piano.clone(), sr, VelocityMode::Light, InstrumentKind::MonoSynth, preset);
+        let mut e = synth_engine(piano.clone(), sr, VelocityMode::Light, inst, preset);
         e.params().set_voice_mode(VoiceMode::Poly);
         e.params().reverb.set(0.0);
+        if together && with_low {
+            e.handle(Event::NoteOn { key: KEYS[0], vel: 100 });
+        }
         for &k in &KEYS[1..] {
             e.handle(Event::NoteOn { key: k, vel: 100 });
         }
-        let _ = e.render(sr as usize / 2);
-        if with_low {
-            e.handle(Event::NoteOn { key: KEYS[0], vel: 100 });
+        if !together {
+            let _ = e.render(sr as usize / 2);
+            if with_low {
+                e.handle(Event::NoteOn { key: KEYS[0], vel: 100 });
+            }
         }
         let mut out = Vec::new();
-        for i in 0..(sr as usize * 9 / 4) / 256 {
+        for i in 0..(sr as usize * (window * 4 + 1) / 4) / 256 {
             let b = e.render(256);
             if i * 256 >= sr as usize / 4 {
                 out.extend(b);
@@ -646,6 +667,46 @@ pub fn chord_check(piano: Arc<Instrument>, sr: u32, preset: usize) -> ChordRow {
     ChordRow { levels, upper_change, limiter_db: limiter }
 }
 
+/// Render cost of the whole engine with notes held, as a percentage of real
+/// time on one core: an idle baseline, every instrument with ten notes held
+/// (two octaves of a chord, velocity 100), and the organ with all 61 keys of
+/// the manual held on the Rock preset with the Leslie at full speed.
+pub fn cpu_report(sr: u32) -> Vec<(String, f32)> {
+    const TEN: [u8; 10] = [36, 43, 48, 52, 55, 60, 64, 67, 72, 76];
+    let piano = no_piano();
+    let secs = 4.0;
+    let measure = |e: &mut Engine| {
+        let _ = e.render(sr as usize / 4);
+        let mut buf = vec![0f32; 128];
+        let blocks = (secs * sr as f32 / 64.0) as usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..blocks {
+            e.process(&mut buf);
+        }
+        t0.elapsed().as_secs_f32() / secs * 100.0
+    };
+    let mut rows = Vec::new();
+    let mut e = synth_engine(piano.clone(), sr, VelocityMode::Light, InstrumentKind::MonoSynth, 0);
+    rows.push(("engine idle (reverb + limiter, no notes)".to_string(), measure(&mut e)));
+    for inst in synth_instruments() {
+        for preset in 0..inst.presets().len() {
+            let mut e = synth_engine(piano.clone(), sr, VelocityMode::Light, inst, preset);
+            e.handle(Event::Sustain(1.0));
+            for k in TEN {
+                e.handle(Event::NoteOn { key: k, vel: 100 });
+            }
+            rows.push((format!("{} / {}, 10 notes", inst.label(), inst.presets()[preset]), measure(&mut e)));
+        }
+    }
+    let mut e = synth_engine(piano, sr, VelocityMode::Light, InstrumentKind::Organ, 2);
+    e.params().leslie_fast.store(true, std::sync::atomic::Ordering::Relaxed);
+    for k in 36..=96u8 {
+        e.handle(Event::NoteOn { key: k, vel: 100 });
+    }
+    rows.push(("Organ / Rock, all 61 keys, Leslie fast".to_string(), measure(&mut e)));
+    rows
+}
+
 /// Offline checks for the synth instruments (no samples needed). Returns a
 /// report and whether everything passed. Writes one WAV per preset into
 /// `wav_dir` if given.
@@ -653,12 +714,12 @@ pub fn synth_check(sr: u32, wav_dir: Option<&std::path::Path>) -> (String, bool)
     use std::fmt::Write;
     let mut r = String::new();
     let mut ok = true;
-    let _ = writeln!(r, "Synth levels (first 1 s, default volume and room; Poly plays the C4-E4-G4 triad, Mono one note: C3 on Bass, C4 otherwise):");
-    let _ = writeln!(r, "  instrument        preset    voices  mode    vel -> played   peak dBFS   RMS dBFS");
+    let _ = writeln!(r, "Synth levels (first 1 s, default volume and room; the C4-E4-G4 triad, except Mono voices: one note, C3 on Bass, C4 otherwise):");
+    let _ = writeln!(r, "  instrument        preset          voices  mode    vel -> played   peak dBFS   RMS dBFS");
     for row in synth_level_report(sr) {
         let _ = writeln!(
             r,
-            "  {:<17} {:<9} {:<7} {:<7} {:>3} -> {:>3}      {:>7.1}    {:>7.1}",
+            "  {:<17} {:<15} {:<7} {:<7} {:>3} -> {:>3}      {:>7.1}    {:>7.1}",
             row.inst.label(),
             row.inst.presets()[row.preset],
             if row.inst == InstrumentKind::MonoSynth { row.voices.label() } else { "-" },
@@ -674,7 +735,13 @@ pub fn synth_check(sr: u32, wav_dir: Option<&std::path::Path>) -> (String, bool)
         }
     }
     let piano = no_piano();
-    for (inst, preset) in [(InstrumentKind::MonoSynth, 0usize), (InstrumentKind::StringMachine, 0)] {
+    for (inst, preset) in [
+        (InstrumentKind::MonoSynth, 0usize),
+        (InstrumentKind::StringMachine, 0),
+        (InstrumentKind::ElectricPiano, 0),
+        (InstrumentKind::Organ, 0),
+        (InstrumentKind::Polysynth, 0),
+    ] {
         let _ = writeln!(r, "\nVolume fader, {} / {} (Light, velocity 64):", inst.label(), inst.presets()[preset]);
         let pn = piano.clone();
         for row in fader_report(&|vol| engine_at_volume(pn.clone(), sr, VelocityMode::Light, inst, preset, vol), level_keys(inst, preset, VoiceMode::Poly), sr) {
@@ -706,8 +773,40 @@ pub fn synth_check(sr: u32, wav_dir: Option<&std::path::Path>) -> (String, bool)
             let _ = writeln!(r, "  ^ FAIL: a note is buried (spread over 12 dB), an upper note ducks, or the limiter pumps");
         }
     }
+    // the same on the new instruments (the electric piano's notes decay, so its
+    // triad has faded a little by the time C2 comes in, 0.5 s later)
+    let _ = writeln!(r, "\nChord C2 + C4-E4-G4 on the other instruments (Light, velocity 100), level at each fundamental, dB:");
+    let _ = writeln!(r, "  instrument / preset              C2      C4      E4      G4    spread   upper notes vs. without C2   limiter");
+    for inst in [InstrumentKind::ElectricPiano, InstrumentKind::Organ, InstrumentKind::Polysynth] {
+        for preset in 0..inst.presets().len() {
+            let row = chord_check_on(piano.clone(), sr, inst, preset);
+            let _ = writeln!(
+                r,
+                "  {:<31} {:>6.1}  {:>6.1}  {:>6.1}  {:>6.1}   {:>5.1}    {:>+5.1} / {:>+5.1} / {:>+5.1}          {:>5.1}",
+                format!("{} / {}", inst.label(), inst.presets()[preset]),
+                row.levels[0],
+                row.levels[1],
+                row.levels[2],
+                row.levels[3],
+                row.spread(),
+                row.upper_change[0],
+                row.upper_change[1],
+                row.upper_change[2],
+                row.limiter_db
+            );
+            if !row.ok() {
+                ok = false;
+                let _ = writeln!(r, "  ^ FAIL: a note is buried (spread over 12 dB), an upper note ducks, or the limiter pumps");
+            }
+        }
+    }
+    // CPU: the whole engine (instrument + reverb + limiter) with notes held
+    let _ = writeln!(r, "\nCPU (whole engine incl. reverb and limiter, 64-frame blocks, one core; % of real time):");
+    for (label, pct) in cpu_report(sr) {
+        let _ = writeln!(r, "  {label:<52} {pct:>6.2} %");
+    }
     let (events, auto) = synth_performance(sr);
-    for inst in [InstrumentKind::MonoSynth, InstrumentKind::StringMachine] {
+    for inst in synth_instruments() {
         for (preset, &voices) in (0..inst.presets().len()).flat_map(|p| voice_modes(inst).iter().map(move |v| (p, v))) {
             let mut e = synth_engine(piano.clone(), sr, VelocityMode::Light, inst, preset);
             e.params().set_voice_mode(voices);
@@ -749,28 +848,34 @@ pub fn synth_check(sr: u32, wav_dir: Option<&std::path::Path>) -> (String, bool)
             }
             if let Some(dir) = wav_dir {
                 let v = if inst == InstrumentKind::MonoSynth { format!("-{}", voices.label().to_lowercase()) } else { String::new() };
-                let file = dir.join(format!("render-{}-{}{v}.wav", inst.label().replace(' ', "-").to_lowercase(), inst.presets()[preset].to_lowercase()));
+                let file = dir.join(format!("render-{}-{}{v}.wav", inst.label().replace(' ', "-").to_lowercase(), inst.presets()[preset].to_lowercase().replace(' ', "-")));
                 let _ = write_wav(&file, &out, sr);
             }
         }
     }
-    // switching instruments while notes are held and ringing
+    // switching instruments while notes are held and ringing: through every
+    // instrument in turn (as a mapped button steps), then back to the strings
     let mut e = synth_engine(piano, sr, VelocityMode::Light, InstrumentKind::StringMachine, 0);
     let mut out = Vec::new();
     for k in [48u8, 60, 64, 67] {
         e.handle(Event::NoteOn { key: k, vel: 100 });
     }
     out.extend(e.render(sr as usize / 2));
-    e.params().set_instrument(InstrumentKind::MonoSynth);
-    e.handle(Event::NoteOn { key: 36, vel: 100 });
-    out.extend(e.render(sr as usize / 2));
-    e.params().set_instrument(InstrumentKind::GrandPiano);
-    out.extend(e.render(sr as usize / 2));
+    let mut inst = InstrumentKind::StringMachine;
+    for (i, key) in [36u8, 43, 50, 57, 62, 69].iter().enumerate() {
+        inst = inst.next();
+        e.params().set_instrument(inst);
+        e.handle(Event::NoteOn { key: *key, vel: 100 });
+        out.extend(e.render(sr as usize / 2));
+        if i % 2 == 1 {
+            e.handle(Event::NoteOff { key: *key });
+        }
+    }
     e.params().set_instrument(InstrumentKind::StringMachine);
     e.handle(Event::NoteOn { key: 72, vel: 100 });
     out.extend(e.render(sr as usize / 2));
     e.handle(Event::AllNotesOff);
-    out.extend(e.render(sr as usize * 2));
+    out.extend(e.render(sr as usize * 3));
     let st = synth_stats(&out, sr);
     let _ = writeln!(r, "\nInstrument switching with notes held: peak {:.2} dBFS, clicks {} (worst ratio {:.1}), voices left {}", db(st.peak), st.clicks, st.worst_click_ratio, e.active_voices());
     if st.clicks > 0 || st.clipped > 0 || e.active_voices() > 0 {

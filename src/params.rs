@@ -54,10 +54,12 @@ pub enum Target {
     OctaveUp,
     /// Button: the Moog-style synth's Voices switch, Poly <-> Mono (a knob/fader picks one).
     Voices,
+    /// Button: the organ's rotating speaker, slow (chorale) <-> fast (tremolo).
+    Leslie,
 }
 
 impl Target {
-    pub const ALL: [Target; 17] = [
+    pub const ALL: [Target; 18] = [
         Target::Volume,
         Target::Tone,
         Target::Reverb,
@@ -75,6 +77,7 @@ impl Target {
         Target::OctaveDown,
         Target::OctaveUp,
         Target::Voices,
+        Target::Leslie,
     ];
     pub fn id(self) -> u8 {
         Target::ALL.iter().position(|t| *t == self).unwrap() as u8
@@ -101,6 +104,7 @@ impl Target {
             Target::OctaveDown => "Octave down",
             Target::OctaveUp => "Octave up",
             Target::Voices => "Synth voices",
+            Target::Leslie => "Leslie slow/fast",
         }
     }
     /// Targets driven by a button press (127 = press) rather than a continuous value.
@@ -115,6 +119,7 @@ impl Target {
                 | Target::OctaveDown
                 | Target::OctaveUp
                 | Target::Voices
+                | Target::Leslie
         )
     }
 }
@@ -129,26 +134,41 @@ pub enum InstrumentKind {
     MonoSynth,
     /// Real-time divide-down string ensemble with ensemble chorus and phaser.
     StringMachine,
+    /// Real-time tine / reed electric piano (pickup model, tremolo).
+    ElectricPiano,
+    /// Real-time tonewheel organ with percussion and a rotating speaker.
+    Organ,
+    /// Real-time 10-voice polysynth (Juno-, Prophet- and Oberheim-style voices).
+    Polysynth,
 }
 
+/// Number of instruments (array sizes for per-instrument settings).
+pub const N_INSTRUMENTS: usize = 6;
+
 impl InstrumentKind {
-    pub const ALL: [InstrumentKind; 3] = [InstrumentKind::GrandPiano, InstrumentKind::MonoSynth, InstrumentKind::StringMachine];
+    pub const ALL: [InstrumentKind; N_INSTRUMENTS] = [
+        InstrumentKind::GrandPiano,
+        InstrumentKind::MonoSynth,
+        InstrumentKind::StringMachine,
+        InstrumentKind::ElectricPiano,
+        InstrumentKind::Organ,
+        InstrumentKind::Polysynth,
+    ];
     pub fn id(self) -> u8 {
         match self {
             InstrumentKind::GrandPiano => 0,
             InstrumentKind::MonoSynth => 1,
             InstrumentKind::StringMachine => 2,
+            InstrumentKind::ElectricPiano => 3,
+            InstrumentKind::Organ => 4,
+            InstrumentKind::Polysynth => 5,
         }
     }
     pub fn from_id(id: u8) -> InstrumentKind {
-        match id {
-            1 => InstrumentKind::MonoSynth,
-            2 => InstrumentKind::StringMachine,
-            _ => InstrumentKind::GrandPiano,
-        }
+        InstrumentKind::ALL.get(id as usize).copied().unwrap_or(InstrumentKind::GrandPiano)
     }
     pub fn next(self) -> InstrumentKind {
-        InstrumentKind::from_id((self.id() + 1) % 3)
+        InstrumentKind::from_id((self.id() + 1) % N_INSTRUMENTS as u8)
     }
     /// Short name for the selector.
     pub fn label(self) -> &'static str {
@@ -156,6 +176,9 @@ impl InstrumentKind {
             InstrumentKind::GrandPiano => "Grand Piano",
             InstrumentKind::MonoSynth => "Moog-style Synth",
             InstrumentKind::StringMachine => "String Machine",
+            InstrumentKind::ElectricPiano => "Electric Piano",
+            InstrumentKind::Organ => "Organ",
+            InstrumentKind::Polysynth => "Polysynth",
         }
     }
     /// Descriptive subtitle.
@@ -164,6 +187,9 @@ impl InstrumentKind {
             InstrumentKind::GrandPiano => "Salamander Grand · Yamaha C5",
             InstrumentKind::MonoSynth => "Moog-style Synth · 3 oscillators · 24 dB ladder filter · Poly (chords) or Mono (legato, glide)",
             InstrumentKind::StringMachine => "String Machine · late-'70s divide-down string ensemble",
+            InstrumentKind::ElectricPiano => "Electric Piano · tine (Rhodes-style) and reed (Wurlitzer-style) model with pickup bark and tremolo",
+            InstrumentKind::Organ => "Organ · B3-style tonewheels, 9 drawbars, percussion and a Leslie-style rotating speaker",
+            InstrumentKind::Polysynth => "Polysynth · Juno-, Prophet- and Oberheim-style voices · 10 voices",
         }
     }
     pub fn is_synth(self) -> bool {
@@ -174,7 +200,18 @@ impl InstrumentKind {
             InstrumentKind::GrandPiano => &[],
             InstrumentKind::MonoSynth => &["Bass", "Lead", "Poly"],
             InstrumentKind::StringMachine => &["Strings", "Phased", "Dark"],
+            InstrumentKind::ElectricPiano => &["Suitcase", "Bright Tines", "Wurli"],
+            InstrumentKind::Organ => &["Jazz", "Gospel", "Rock", "Ballad"],
+            InstrumentKind::Polysynth => &["80s Pad", "Brass Stab", "Synthwave Lead", "Juno Strings", "OB Brass"],
         }
+    }
+    /// Whether velocity changes the sound (the organ's keys are on/off).
+    pub fn velocity_sensitive(self) -> bool {
+        self != InstrumentKind::Organ
+    }
+    /// Default pitch-bend range in semitones (the organ's is off, like the original).
+    pub fn default_bend(self) -> u8 {
+        if self == InstrumentKind::Organ { 0 } else { DEFAULT_BEND_RANGE }
     }
 }
 
@@ -298,13 +335,25 @@ pub struct Params {
     // ---- instruments ----
     pub instrument: AtomicU8,
     /// preset index per instrument
-    pub preset: [AtomicU8; 3],
-    /// filter cutoff knob per synth instrument (index = instrument id; 0 unused)
-    pub synth_cutoff: [AtomicF32; 3],
-    /// mod wheel for the synths (vibrato depth)
+    pub preset: [AtomicU8; N_INSTRUMENTS],
+    /// the Tone knob per non-piano instrument (index = instrument id; 0 unused):
+    /// filter cutoff on the synths, brightness on the electric piano, drive on the organ
+    pub synth_cutoff: [AtomicF32; N_INSTRUMENTS],
+    /// mod wheel for the non-piano instruments: vibrato (synths), tremolo depth
+    /// (electric piano); on the organ, crossing the middle switches the Leslie
     pub vibrato: AtomicF32,
     pub glide: AtomicF32,
+    /// Moog-style synth resonance
     pub resonance: AtomicF32,
+    /// Polysynth resonance
+    pub poly_resonance: AtomicF32,
+    /// organ: drawbars (0..8 each, 16' first), percussion switches, Leslie speed
+    pub drawbars: [AtomicU8; 9],
+    pub perc_on: AtomicBool,
+    pub perc_third: AtomicBool,
+    pub perc_fast: AtomicBool,
+    pub perc_soft: AtomicBool,
+    pub leslie_fast: AtomicBool,
     /// Moog-style synth: Voices switch (VoiceMode id; 0 = Poly, the default)
     /// and mono note priority (NotePriority id; 0 = Last)
     pub synth_voices: AtomicU8,
@@ -314,8 +363,8 @@ pub struct Params {
     /// the wheel, -1..+1 (0 = centre)
     pub pitch_bend: AtomicF32,
     /// bend range in semitones per instrument, up and down (0..12)
-    pub bend_up: [AtomicU8; 3],
-    pub bend_down: [AtomicU8; 3],
+    pub bend_up: [AtomicU8; N_INSTRUMENTS],
+    pub bend_down: [AtomicU8; N_INSTRUMENTS],
     /// the piano ignores pitch bend unless this is on
     pub piano_bend: AtomicBool,
 
@@ -382,15 +431,25 @@ impl Default for Params {
                 AtomicF32::new(0.5),
                 AtomicF32::new(crate::synth::MONO_PRESETS[0].cutoff),
                 AtomicF32::new(crate::strings::STRING_PRESETS[0].cutoff),
+                AtomicF32::new(crate::ep::EP_PRESETS[0].tone),
+                AtomicF32::new(crate::organ::ORGAN_PRESETS[0].drive),
+                AtomicF32::new(crate::poly::POLY_PRESETS[0].cutoff),
             ],
             vibrato: AtomicF32::new(0.0),
             glide: AtomicF32::new(crate::synth::MONO_PRESETS[0].glide),
             resonance: AtomicF32::new(crate::synth::MONO_PRESETS[0].resonance),
+            poly_resonance: AtomicF32::new(crate::poly::POLY_PRESETS[0].resonance),
+            drawbars: std::array::from_fn(|i| AtomicU8::new(crate::organ::ORGAN_PRESETS[0].drawbars[i])),
+            perc_on: AtomicBool::new(crate::organ::ORGAN_PRESETS[0].perc),
+            perc_third: AtomicBool::new(crate::organ::ORGAN_PRESETS[0].perc_third),
+            perc_fast: AtomicBool::new(crate::organ::ORGAN_PRESETS[0].perc_fast),
+            perc_soft: AtomicBool::new(crate::organ::ORGAN_PRESETS[0].perc_soft),
+            leslie_fast: AtomicBool::new(false),
             synth_voices: AtomicU8::new(crate::synth::VoiceMode::Poly.id()),
             note_priority: AtomicU8::new(crate::synth::NotePriority::Last.id()),
             pitch_bend: AtomicF32::new(0.0),
-            bend_up: std::array::from_fn(|_| AtomicU8::new(DEFAULT_BEND_RANGE)),
-            bend_down: std::array::from_fn(|_| AtomicU8::new(DEFAULT_BEND_RANGE)),
+            bend_up: std::array::from_fn(|i| AtomicU8::new(InstrumentKind::from_id(i as u8).default_bend())),
+            bend_down: std::array::from_fn(|i| AtomicU8::new(InstrumentKind::from_id(i as u8).default_bend())),
             piano_bend: AtomicBool::new(false),
             octave: AtomicI32::new(0),
             transpose: AtomicI32::new(0),
@@ -480,8 +539,43 @@ impl Params {
             InstrumentKind::StringMachine => {
                 self.synth_cutoff[2].set(crate::strings::STRING_PRESETS[idx].cutoff);
             }
+            InstrumentKind::ElectricPiano => {
+                self.synth_cutoff[3].set(crate::ep::EP_PRESETS[idx].tone);
+            }
+            InstrumentKind::Organ => {
+                let p = &crate::organ::ORGAN_PRESETS[idx];
+                self.synth_cutoff[4].set(p.drive);
+                for (d, v) in self.drawbars.iter().zip(p.drawbars) {
+                    d.store(v, Ordering::Relaxed);
+                }
+                self.perc_on.store(p.perc, Ordering::Relaxed);
+                self.perc_third.store(p.perc_third, Ordering::Relaxed);
+                self.perc_fast.store(p.perc_fast, Ordering::Relaxed);
+                self.perc_soft.store(p.perc_soft, Ordering::Relaxed);
+            }
+            InstrumentKind::Polysynth => {
+                let p = &crate::poly::POLY_PRESETS[idx];
+                self.synth_cutoff[5].set(p.cutoff);
+                self.poly_resonance.set(p.resonance);
+            }
             InstrumentKind::GrandPiano => {}
         }
+    }
+    /// The organ's live settings (drawbars, percussion, drive, Leslie speed).
+    pub fn organ_controls(&self) -> crate::organ::OrganControls {
+        crate::organ::OrganControls {
+            drawbars: std::array::from_fn(|i| self.drawbars[i].load(Ordering::Relaxed).min(8)),
+            perc: self.perc_on.load(Ordering::Relaxed),
+            perc_third: self.perc_third.load(Ordering::Relaxed),
+            perc_fast: self.perc_fast.load(Ordering::Relaxed),
+            perc_soft: self.perc_soft.load(Ordering::Relaxed),
+            drive: self.synth_cutoff[4].get(),
+            leslie_fast: self.leslie_fast.load(Ordering::Relaxed),
+            bend: self.bend_semis(InstrumentKind::Organ),
+        }
+    }
+    pub fn toggle_leslie(&self) {
+        self.leslie_fast.fetch_xor(true, Ordering::Relaxed);
     }
     pub fn voice_mode(&self) -> crate::synth::VoiceMode {
         crate::synth::VoiceMode::from_id(self.synth_voices.load(Ordering::Relaxed))
@@ -566,18 +660,20 @@ impl Params {
             Target::Touch => self.touch_pos(),
             Target::Sustain => self.sustain.get(),
             Target::VelocityMode => self.mode().id() as f32 / 2.0,
-            Target::Instrument => inst.id() as f32 / 2.0,
+            Target::Instrument => inst.id() as f32 / (N_INSTRUMENTS - 1) as f32,
             Target::Preset => {
                 let n = inst.presets().len();
                 if n > 1 { self.preset_of(inst) as f32 / (n - 1) as f32 } else { 0.0 }
             }
             Target::Glide => self.glide.get(),
+            Target::Resonance if inst == InstrumentKind::Polysynth => self.poly_resonance.get(),
             Target::Resonance => self.resonance.get(),
             Target::MetronomeStartStop => if self.metro_running.load(Ordering::Relaxed) { 1.0 } else { 0.0 },
             Target::Tempo => (self.tempo_bpm() - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN),
             Target::TapTempo => 0.0,
             Target::OctaveDown | Target::OctaveUp => (self.octave.load(Ordering::Relaxed) + 3) as f32 / 6.0,
             Target::Voices => self.voice_mode().id() as f32,
+            Target::Leslie => if self.leslie_fast.load(Ordering::Relaxed) { 1.0 } else { 0.0 },
         }
     }
     pub fn set_target(&self, t: Target, v: f32) {
@@ -588,12 +684,21 @@ impl Params {
             Target::Tone if inst.is_synth() => self.synth_cutoff[inst.id() as usize].set(v),
             Target::Tone => self.tone.set(v),
             Target::Reverb => self.reverb.set(v),
+            Target::Modulation if inst == InstrumentKind::Organ => {
+                // the wheel switches the Leslie when it crosses the middle (so a
+                // mapped button can still toggle it while the wheel rests)
+                let old = self.vibrato.get();
+                self.vibrato.set(v);
+                if (old >= 0.5) != (v >= 0.5) {
+                    self.leslie_fast.store(v >= 0.5, Ordering::Relaxed);
+                }
+            }
             Target::Modulation if inst.is_synth() => self.vibrato.set(v),
             Target::Modulation => self.modulation.set(v),
             Target::Touch => self.set_touch_pos(v),
             Target::Sustain => self.sustain.set(v),
             Target::VelocityMode => self.set_mode(VelocityMode::from_id((v * 2.0).round() as u8)),
-            Target::Instrument => self.set_instrument(InstrumentKind::from_id((v * 2.0).round() as u8)),
+            Target::Instrument => self.set_instrument(InstrumentKind::from_id((v * (N_INSTRUMENTS - 1) as f32).round() as u8)),
             Target::Preset => {
                 let n = inst.presets().len();
                 if n > 0 {
@@ -604,12 +709,14 @@ impl Params {
                 }
             }
             Target::Glide => self.glide.set(v),
+            Target::Resonance if inst == InstrumentKind::Polysynth => self.poly_resonance.set(v),
             Target::Resonance => self.resonance.set(v),
             Target::MetronomeStartStop => self.metro_running.store(v >= 0.5, Ordering::Relaxed),
             Target::Tempo => self.set_tempo_bpm(TEMPO_MIN + v * (TEMPO_MAX - TEMPO_MIN)),
             Target::TapTempo => {}
             Target::OctaveDown | Target::OctaveUp => self.octave.store((v * 6.0).round() as i32 - 3, Ordering::Relaxed),
             Target::Voices => self.set_voice_mode(crate::synth::VoiceMode::from_id((v >= 0.5) as u8)),
+            Target::Leslie => self.leslie_fast.store(v >= 0.5, Ordering::Relaxed),
         }
     }
     pub fn key_bit(arr: &[AtomicU64; 2], key: u8, on: bool) {

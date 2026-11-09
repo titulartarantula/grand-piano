@@ -85,8 +85,21 @@ pub fn tanh_fast(x: f32) -> f32 {
     }
 }
 
+/// One band-limited sample of a pulse wave with duty cycle `w` (0..1) at phase
+/// `t`, increment `dt`; DC-free (the mean 2w-1 is removed), so changing the
+/// width (PWM) doesn't shift the waveform's level.
 #[inline(always)]
-fn flush(x: f32) -> f32 {
+pub fn pulse_sample(t: f32, dt: f32, w: f32) -> f32 {
+    let naive = if t < w { 1.0 } else { -1.0 };
+    let mut t2 = t - w;
+    if t2 < 0.0 {
+        t2 += 1.0;
+    }
+    naive + poly_blep(t, dt) - poly_blep(t2, dt) - (2.0 * w - 1.0)
+}
+
+#[inline(always)]
+pub fn flush(x: f32) -> f32 {
     if x.abs() < 1e-15 { 0.0 } else { x }
 }
 

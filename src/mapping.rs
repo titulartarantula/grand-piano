@@ -136,7 +136,8 @@ impl Mapper {
             | Target::TapTempo
             | Target::OctaveDown
             | Target::OctaveUp
-            | Target::Voices => {
+            | Target::Voices
+            | Target::Leslie => {
                 // A button: each press (rising past the middle) acts once.
                 // Buttons send 127 on press and 0 on release.
                 if value == 127 && prev < 64 {
@@ -148,6 +149,7 @@ impl Mapper {
                         Target::OctaveDown => params.step_octave(-1),
                         Target::OctaveUp => params.step_octave(1),
                         Target::Voices => params.set_voice_mode(params.voice_mode().toggled()),
+                        Target::Leslie => params.toggle_leslie(),
                         _ => params.tap(now_us()),
                     }
                 } else if value != 0 && value != 127 && t != Target::TapTempo {
@@ -223,7 +225,14 @@ mod tests {
         m.handle_cc(&p, 102, 127); // learning press does nothing else
         m.handle_cc(&p, 102, 0);
         assert_eq!(p.instrument(), InstrumentKind::GrandPiano);
-        for want in [InstrumentKind::MonoSynth, InstrumentKind::StringMachine, InstrumentKind::GrandPiano] {
+        for want in [
+            InstrumentKind::MonoSynth,
+            InstrumentKind::StringMachine,
+            InstrumentKind::ElectricPiano,
+            InstrumentKind::Organ,
+            InstrumentKind::Polysynth,
+            InstrumentKind::GrandPiano,
+        ] {
             m.handle_cc(&p, 102, 127);
             m.handle_cc(&p, 102, 0);
             assert_eq!(p.instrument(), want);
@@ -277,6 +286,55 @@ mod tests {
         assert_eq!(p.voice_mode(), VoiceMode::Mono);
         m.handle_cc(&p, 21, 10);
         assert_eq!(p.voice_mode(), VoiceMode::Poly);
+    }
+
+    #[test]
+    fn leslie_button_and_mod_wheel_on_the_organ() {
+        use crate::params::InstrumentKind;
+        let m = Mapper::with_defaults();
+        let p = Params::default();
+        p.set_instrument(InstrumentKind::Organ);
+        let fast = || p.leslie_fast.load(Ordering::Relaxed);
+        assert!(!fast(), "chorale at start");
+        // the mod wheel (CC1): crossing 64 switches it, in both directions
+        m.handle_cc(&p, 1, 40);
+        assert!(!fast());
+        m.handle_cc(&p, 1, 64);
+        assert!(fast());
+        m.handle_cc(&p, 1, 100);
+        assert!(fast());
+        m.handle_cc(&p, 1, 63);
+        assert!(!fast());
+        // a learned button toggles it; a resting wheel doesn't fight the button
+        m.start_learn(Target::Leslie);
+        m.handle_cc(&p, 105, 127);
+        m.handle_cc(&p, 105, 0);
+        assert!(!fast(), "the learning press does nothing else");
+        m.handle_cc(&p, 105, 127);
+        m.handle_cc(&p, 105, 0);
+        assert!(fast());
+        m.handle_cc(&p, 1, 20); // wheel moves but stays below the middle
+        assert!(fast());
+        m.handle_cc(&p, 105, 127);
+        m.handle_cc(&p, 105, 0);
+        assert!(!fast());
+        // on the other synths the wheel is vibrato / tremolo, the Leslie isn't touched
+        p.set_instrument(InstrumentKind::Polysynth);
+        m.handle_cc(&p, 1, 127);
+        assert!(!fast());
+        assert_eq!(p.vibrato.get(), 1.0);
+    }
+
+    #[test]
+    fn resonance_is_per_synth() {
+        use crate::params::InstrumentKind;
+        let m = Mapper::with_defaults();
+        let p = Params::default();
+        m.set(70, Some(Target::Resonance));
+        p.set_instrument(InstrumentKind::Polysynth);
+        m.handle_cc(&p, 70, 127);
+        assert_eq!(p.poly_resonance.get(), 1.0);
+        assert_eq!(p.resonance.get(), crate::synth::MONO_PRESETS[0].resonance, "Moog-style resonance untouched");
     }
 
     #[test]

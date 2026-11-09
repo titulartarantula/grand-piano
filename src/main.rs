@@ -83,7 +83,7 @@ mod cli {
         if has("--help") {
             o.line("GrandPiano.exe [--selftest] [--download-samples [--archive FILE]] [--render-test [OUT.wav]] [--synth-test]");
             o.line("  --synth-test renders the synth presets offline and checks levels, clipping and clicks (no samples, no audio device).");
-            o.line("  --render-test also renders the Moog-style Synth (Poly and Mono) and String Machine presets (render-<instrument>-<preset>[-<voices>].wav next to the log).");
+            o.line("  --render-test also renders every real-time instrument's presets (Moog-style Synth in Poly and Mono, String Machine, Electric Piano, Organ, Polysynth) as render-<instrument>-<preset>[-<voices>].wav next to the log.");
             return 0;
         }
         o.line(format!("Grand Piano {} self-test", grand_piano::VERSION));

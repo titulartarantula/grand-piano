@@ -68,9 +68,28 @@ pub struct Settings {
     pub mono_priority: crate::synth::NotePriority,
     /// mod wheel position for the synths (vibrato)
     pub synth_vibrato: f32,
-    // ---- pitch bend: range in semitones per instrument (piano, mono, strings)
-    pub bend_up: [u8; 3],
-    pub bend_down: [u8; 3],
+    // ---- electric piano, organ, polysynth (added later; older files load these defaults)
+    pub ep_preset: u8,
+    pub organ_preset: u8,
+    pub poly_preset: u8,
+    /// Tone knob of each: brightness, drive, filter cutoff
+    pub ep_tone: f32,
+    pub organ_drive: f32,
+    pub poly_cutoff: f32,
+    pub poly_resonance: f32,
+    /// organ drawbars (16' first, 0..8) and percussion switches
+    pub organ_drawbars: [u8; 9],
+    pub organ_perc: bool,
+    pub organ_perc_third: bool,
+    pub organ_perc_fast: bool,
+    pub organ_perc_soft: bool,
+    /// Leslie speed: false = chorale (slow), true = tremolo (fast)
+    pub leslie_fast: bool,
+    // ---- pitch bend: range in semitones per instrument, in selector order
+    // (piano, Moog-style, strings, electric piano, organ, polysynth). Older
+    // files have three entries; the rest get their defaults (organ: off).
+    pub bend_up: Vec<u8>,
+    pub bend_down: Vec<u8>,
     /// the piano ignores the pitch wheel unless this is on
     pub piano_bend: bool,
     // ---- the app's octave shift (-3..+3) and transpose (-12..+12 semitones)
@@ -112,8 +131,21 @@ impl Default for Settings {
             mono_voices: crate::synth::VoiceMode::Poly,
             mono_priority: crate::synth::NotePriority::Last,
             synth_vibrato: 0.0,
-            bend_up: [crate::params::DEFAULT_BEND_RANGE; 3],
-            bend_down: [crate::params::DEFAULT_BEND_RANGE; 3],
+            ep_preset: 0,
+            organ_preset: 0,
+            poly_preset: 0,
+            ep_tone: crate::ep::EP_PRESETS[0].tone,
+            organ_drive: crate::organ::ORGAN_PRESETS[0].drive,
+            poly_cutoff: crate::poly::POLY_PRESETS[0].cutoff,
+            poly_resonance: crate::poly::POLY_PRESETS[0].resonance,
+            organ_drawbars: crate::organ::ORGAN_PRESETS[0].drawbars,
+            organ_perc: crate::organ::ORGAN_PRESETS[0].perc,
+            organ_perc_third: crate::organ::ORGAN_PRESETS[0].perc_third,
+            organ_perc_fast: crate::organ::ORGAN_PRESETS[0].perc_fast,
+            organ_perc_soft: crate::organ::ORGAN_PRESETS[0].perc_soft,
+            leslie_fast: false,
+            bend_up: InstrumentKind::ALL.iter().map(|i| i.default_bend()).collect(),
+            bend_down: InstrumentKind::ALL.iter().map(|i| i.default_bend()).collect(),
             piano_bend: false,
             octave: 0,
             transpose: 0,
@@ -172,6 +204,21 @@ impl Settings {
         p.set_instrument(self.instrument);
         p.preset[InstrumentKind::MonoSynth.id() as usize].store(self.mono_preset.min(2), Ordering::Relaxed);
         p.preset[InstrumentKind::StringMachine.id() as usize].store(self.strings_preset.min(2), Ordering::Relaxed);
+        p.preset[InstrumentKind::ElectricPiano.id() as usize].store(self.ep_preset.min(crate::ep::EP_PRESETS.len() as u8 - 1), Ordering::Relaxed);
+        p.preset[InstrumentKind::Organ.id() as usize].store(self.organ_preset.min(crate::organ::ORGAN_PRESETS.len() as u8 - 1), Ordering::Relaxed);
+        p.preset[InstrumentKind::Polysynth.id() as usize].store(self.poly_preset.min(crate::poly::POLY_PRESETS.len() as u8 - 1), Ordering::Relaxed);
+        p.synth_cutoff[3].set(self.ep_tone.clamp(0.0, 1.0));
+        p.synth_cutoff[4].set(self.organ_drive.clamp(0.0, 1.0));
+        p.synth_cutoff[5].set(self.poly_cutoff.clamp(0.0, 1.0));
+        p.poly_resonance.set(self.poly_resonance.clamp(0.0, 1.0));
+        for (d, v) in p.drawbars.iter().zip(self.organ_drawbars) {
+            d.store(v.min(8), Ordering::Relaxed);
+        }
+        p.perc_on.store(self.organ_perc, Ordering::Relaxed);
+        p.perc_third.store(self.organ_perc_third, Ordering::Relaxed);
+        p.perc_fast.store(self.organ_perc_fast, Ordering::Relaxed);
+        p.perc_soft.store(self.organ_perc_soft, Ordering::Relaxed);
+        p.leslie_fast.store(self.leslie_fast, Ordering::Relaxed);
         p.synth_cutoff[1].set(self.mono_cutoff.clamp(0.0, 1.0));
         p.synth_cutoff[2].set(self.strings_cutoff.clamp(0.0, 1.0));
         p.resonance.set(self.mono_resonance.clamp(0.0, 1.0));
@@ -179,9 +226,11 @@ impl Settings {
         p.set_voice_mode(self.mono_voices);
         p.set_note_priority(self.mono_priority);
         p.vibrato.set(self.synth_vibrato.clamp(0.0, 1.0));
-        for i in 0..3 {
-            p.bend_up[i].store(self.bend_up[i].min(crate::params::MAX_BEND_RANGE), Ordering::Relaxed);
-            p.bend_down[i].store(self.bend_down[i].min(crate::params::MAX_BEND_RANGE), Ordering::Relaxed);
+        for (i, inst) in InstrumentKind::ALL.iter().enumerate() {
+            let up = self.bend_up.get(i).copied().unwrap_or(inst.default_bend());
+            let down = self.bend_down.get(i).copied().unwrap_or(inst.default_bend());
+            p.bend_up[i].store(up.min(crate::params::MAX_BEND_RANGE), Ordering::Relaxed);
+            p.bend_down[i].store(down.min(crate::params::MAX_BEND_RANGE), Ordering::Relaxed);
         }
         p.piano_bend.store(self.piano_bend, Ordering::Relaxed);
         p.octave.store(self.octave.clamp(crate::keyrange::OCTAVE_MIN, crate::keyrange::OCTAVE_MAX), Ordering::Relaxed);
@@ -214,10 +263,21 @@ impl Settings {
         self.mono_voices = p.voice_mode();
         self.mono_priority = p.note_priority();
         self.synth_vibrato = p.vibrato.get();
-        for i in 0..3 {
-            self.bend_up[i] = p.bend_up[i].load(Ordering::Relaxed);
-            self.bend_down[i] = p.bend_down[i].load(Ordering::Relaxed);
-        }
+        self.ep_preset = p.preset_of(InstrumentKind::ElectricPiano) as u8;
+        self.organ_preset = p.preset_of(InstrumentKind::Organ) as u8;
+        self.poly_preset = p.preset_of(InstrumentKind::Polysynth) as u8;
+        self.ep_tone = p.synth_cutoff[3].get();
+        self.organ_drive = p.synth_cutoff[4].get();
+        self.poly_cutoff = p.synth_cutoff[5].get();
+        self.poly_resonance = p.poly_resonance.get();
+        self.organ_drawbars = std::array::from_fn(|i| p.drawbars[i].load(Ordering::Relaxed));
+        self.organ_perc = p.perc_on.load(Ordering::Relaxed);
+        self.organ_perc_third = p.perc_third.load(Ordering::Relaxed);
+        self.organ_perc_fast = p.perc_fast.load(Ordering::Relaxed);
+        self.organ_perc_soft = p.perc_soft.load(Ordering::Relaxed);
+        self.leslie_fast = p.leslie_fast.load(Ordering::Relaxed);
+        self.bend_up = p.bend_up.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        self.bend_down = p.bend_down.iter().map(|x| x.load(Ordering::Relaxed)).collect();
         self.piano_bend = p.piano_bend.load(Ordering::Relaxed);
         self.octave = p.octave.load(Ordering::Relaxed);
         self.transpose = p.transpose.load(Ordering::Relaxed);
@@ -250,7 +310,7 @@ mod tests {
         assert_eq!(partial.instrument, InstrumentKind::GrandPiano);
         assert_eq!(partial.tempo, 100.0);
         assert_eq!(partial.beats_per_bar, 4);
-        assert_eq!(partial.bend_up, [2, 2, 2]);
+        assert_eq!(partial.bend_up, vec![2, 2, 2, 2, 0, 2], "organ bend is off by default");
         assert!(!partial.piano_bend);
     }
 
@@ -276,6 +336,49 @@ mod tests {
         assert!(j.contains(r#""mono_voices":"Mono""#) && j.contains(r#""mono_priority":"Low""#), "{j}");
         let u: Settings = serde_json::from_str(&j).unwrap();
         assert_eq!((u.mono_voices, u.mono_priority), (VoiceMode::Mono, NotePriority::Low));
+    }
+
+    #[test]
+    fn older_files_with_three_bend_ranges_still_load() {
+        let old = r#"{"volume":0.8,"bend_up":[2,5,7],"bend_down":[2,12,3],"instrument":"StringMachine"}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.instrument, InstrumentKind::StringMachine, "the rest of the file isn't lost");
+        let p = Params::default();
+        s.apply_to(&p, &Mapper::with_defaults());
+        let up: Vec<u8> = p.bend_up.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        let down: Vec<u8> = p.bend_down.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        assert_eq!(up, vec![2, 5, 7, 2, 0, 2]);
+        assert_eq!(down, vec![2, 12, 3, 2, 0, 2]);
+    }
+
+    #[test]
+    fn new_instrument_settings_roundtrip() {
+        let p = Params::default();
+        let m = Mapper::with_defaults();
+        p.set_instrument(InstrumentKind::Organ);
+        p.select_preset(InstrumentKind::Organ, 1); // Gospel: percussion on
+        p.drawbars[8].store(5, Ordering::Relaxed);
+        p.leslie_fast.store(true, Ordering::Relaxed);
+        p.select_preset(InstrumentKind::Polysynth, 4);
+        p.poly_resonance.set(0.77);
+        p.select_preset(InstrumentKind::ElectricPiano, 2);
+        p.synth_cutoff[3].set(0.9);
+        let mut s = Settings::default();
+        s.capture(&p, &m);
+        let t: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        let q = Params::default();
+        t.apply_to(&q, &m);
+        assert_eq!(q.instrument(), InstrumentKind::Organ);
+        assert_eq!(q.preset_of(InstrumentKind::Organ), 1);
+        assert!(q.perc_on.load(Ordering::Relaxed));
+        assert_eq!(q.drawbars[8].load(Ordering::Relaxed), 5);
+        assert!(q.leslie_fast.load(Ordering::Relaxed));
+        assert_eq!(q.preset_of(InstrumentKind::Polysynth), 4);
+        assert!((q.poly_resonance.get() - 0.77).abs() < 1e-6);
+        assert_eq!(q.preset_of(InstrumentKind::ElectricPiano), 2);
+        assert!((q.synth_cutoff[3].get() - 0.9).abs() < 1e-6);
+        // and the Moog-style synth's resonance is separate from the polysynth's
+        assert_eq!(q.resonance.get(), crate::synth::MONO_PRESETS[0].resonance);
     }
 
     #[test]

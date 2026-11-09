@@ -15,6 +15,9 @@ use crate::metronome::{MetroControls, Metronome};
 use crate::params::{InstrumentKind, Params, now_us, volume_gain};
 use crate::strings::{StringControls, StringMachine};
 use crate::synth::{MonoControls, MonoSynth};
+use crate::ep::{ElectricPiano, EpControls};
+use crate::organ::Organ;
+use crate::poly::{PolyControls, Polysynth};
 use crate::sfz::RegionKind;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -118,6 +121,9 @@ pub struct Engine {
     current: InstrumentKind,
     mono: Box<MonoSynth>,
     strings: Box<StringMachine>,
+    ep: Box<ElectricPiano>,
+    organ: Box<Organ>,
+    poly: Box<Polysynth>,
     synth_down: [bool; 128],
     metro: Metronome,
     /// piano pitch-bend playback-rate multiplier at the end of the last block
@@ -152,6 +158,9 @@ impl Engine {
             current: InstrumentKind::GrandPiano,
             mono: Box::new(MonoSynth::new(sr)),
             strings: Box::new(StringMachine::new(sr)),
+            ep: Box::new(ElectricPiano::new(sr)),
+            organ: Box::new(Organ::new(sr)),
+            poly: Box::new(Polysynth::new(sr)),
             synth_down: [false; 128],
             metro: Metronome::new(sample_rate),
             piano_bend_mul: 1.0,
@@ -161,6 +170,9 @@ impl Engine {
         e.mono.set_voice_mode(e.params.voice_mode());
         e.mono.set_priority(e.params.note_priority());
         e.strings.set_preset(e.params.preset_of(InstrumentKind::StringMachine));
+        e.ep.set_preset(e.params.preset_of(InstrumentKind::ElectricPiano));
+        e.organ.set_preset(e.params.preset_of(InstrumentKind::Organ));
+        e.poly.set_preset(e.params.preset_of(InstrumentKind::Polysynth));
         e
     }
 
@@ -195,6 +207,18 @@ impl Engine {
             self.strings.release_all();
             self.strings.set_preset(sp);
         }
+        let ep = self.params.preset_of(InstrumentKind::ElectricPiano);
+        if ep != self.ep.preset() {
+            self.ep.set_preset(ep); // releases its notes
+        }
+        let op = self.params.preset_of(InstrumentKind::Organ);
+        if op != self.organ.preset() {
+            self.organ.set_preset(op); // the drawbars change smoothly; notes keep sounding
+        }
+        let pp = self.params.preset_of(InstrumentKind::Polysynth);
+        if pp != self.poly.preset() {
+            self.poly.set_preset(pp); // releases its notes
+        }
     }
 
     /// Follows the Voices switch and note priority (a switch releases the
@@ -207,6 +231,9 @@ impl Engine {
     fn synth_release_all(&mut self) {
         self.mono.release_all();
         self.strings.release_all();
+        self.ep.release_all();
+        self.organ.release_all();
+        self.poly.release_all();
         for k in 0..128u8 {
             if self.synth_down[k as usize] {
                 self.synth_down[k as usize] = false;
@@ -225,6 +252,10 @@ impl Engine {
                 self.mono.note_on(key, vel, self.params.glide.get())
             }
             InstrumentKind::StringMachine => self.strings.note_on(key, vel),
+            InstrumentKind::ElectricPiano => self.ep.note_on(key, vel),
+            // organ keys are on/off: velocity doesn't change the sound
+            InstrumentKind::Organ => self.organ.note_on(key),
+            InstrumentKind::Polysynth => self.poly.note_on(key, vel),
             InstrumentKind::GrandPiano => return,
         }
         self.synth_down[key as usize] = true;
@@ -238,6 +269,9 @@ impl Engine {
         self.synth_down[key as usize] = false;
         self.mono.note_off(key);
         self.strings.note_off(key);
+        self.ep.note_off(key);
+        self.organ.note_off(key);
+        self.poly.note_off(key);
         if !self.keys[key as usize].down {
             Params::key_bit(&self.params.keys_down, key, false);
         }
@@ -257,7 +291,11 @@ impl Engine {
     }
 
     pub fn active_voices(&self) -> usize {
-        self.voices.iter().filter(|v| v.active).count() + self.mono.active_voices() + self.strings.active_voices()
+        self.voices.iter().filter(|v| v.active).count() + self.synth_voices()
+    }
+
+    fn synth_voices(&self) -> usize {
+        self.mono.active_voices() + self.strings.active_voices() + self.ep.active_voices() + self.organ.active_voices() + self.poly.active_voices()
     }
 
     fn rand(&mut self) -> f32 {
@@ -293,6 +331,9 @@ impl Engine {
                 self.sustain(v);
                 self.mono.sustain(v >= 0.5);
                 self.strings.sustain(v >= 0.5);
+                self.ep.sustain(v >= 0.5);
+                self.organ.sustain(v >= 0.5);
+                self.poly.sustain(v >= 0.5);
             }
             Event::AllNotesOff => {
                 for k in 0..128u8 {
@@ -305,6 +346,9 @@ impl Engine {
             Event::Panic => {
                 self.mono.panic();
                 self.strings.panic();
+                self.ep.panic();
+                self.organ.panic();
+                self.poly.panic();
                 self.synth_down = [false; 128];
                 for v in self.voices.iter_mut().filter(|v| v.active) {
                     v.fading = true;
@@ -587,7 +631,10 @@ impl Engine {
         }
         self.mono.sounding(&mut sounding);
         self.strings.sounding(&mut sounding);
-        count += (self.mono.active_voices() + self.strings.active_voices()) as u32;
+        self.ep.sounding(&mut sounding);
+        self.organ.sounding(&mut sounding);
+        self.poly.sounding(&mut sounding);
+        count += self.synth_voices() as u32;
         self.params.keys_sounding[0].store(sounding[0], Ordering::Relaxed);
         self.params.keys_sounding[1].store(sounding[1], Ordering::Relaxed);
         self.params.active_voices.store(count, Ordering::Relaxed);
@@ -677,6 +724,20 @@ impl Engine {
         self.mono.render(&mut self.dry[..n * 2], n, mc);
         let sc = StringControls { cutoff: p.synth_cutoff[2].get(), vibrato: p.vibrato.get(), bend: bend_for(InstrumentKind::StringMachine) };
         self.strings.render(&mut self.dry[..n * 2], n, sc);
+        let ec = EpControls { tone: p.synth_cutoff[3].get(), tremolo: p.vibrato.get(), bend: bend_for(InstrumentKind::ElectricPiano) };
+        self.ep.render(&mut self.dry[..n * 2], n, ec);
+        let mut oc = p.organ_controls();
+        if cur != InstrumentKind::Organ {
+            oc.bend = 0.0;
+        }
+        self.organ.render(&mut self.dry[..n * 2], n, oc);
+        let pc = PolyControls {
+            cutoff: p.synth_cutoff[5].get(),
+            resonance: p.poly_resonance.get(),
+            vibrato: p.vibrato.get(),
+            bend: bend_for(InstrumentKind::Polysynth),
+        };
+        self.poly.render(&mut self.dry[..n * 2], n, pc);
         self.clock += n as u64;
     }
 
@@ -897,6 +958,57 @@ mod tests {
         }
         assert_eq!(e.mono.active_voices(), 1);
         assert_eq!(e.mono.mono_pitch(), Some(36.0), "last-note priority by default");
+    }
+
+    /// C2 + C4-E4-G4 on every preset of the new instruments: every note
+    /// audible (within 12 dB of the loudest), the held notes don't duck, and
+    /// the limiter stays out of it.
+    #[test]
+    fn new_instruments_keep_every_chord_note_audible() {
+        for inst in [InstrumentKind::ElectricPiano, InstrumentKind::Organ, InstrumentKind::Polysynth] {
+            for preset in 0..inst.presets().len() {
+                let row = crate::analysis::chord_check_on(Arc::new(testlib::instrument()), 48000, inst, preset);
+                assert!(row.ok(), "{} / {}: {row:?}", inst.label(), inst.presets()[preset]);
+            }
+        }
+    }
+
+    #[test]
+    fn organ_ignores_velocity_and_mode() {
+        use crate::params::VelocityMode;
+        let render = |mode: VelocityMode, vel: u8| {
+            let mut e = engine();
+            e.params.set_mode(mode);
+            e.params.set_instrument(InstrumentKind::Organ);
+            for k in [60u8, 64, 67] {
+                e.handle(Event::NoteOn { key: k, vel });
+            }
+            e.render(24000)
+        };
+        let a = render(VelocityMode::Normal, 20);
+        for (m, v) in [(VelocityMode::Normal, 127), (VelocityMode::Light, 64), (VelocityMode::Fixed, 1)] {
+            assert_eq!(render(m, v), a, "{m:?} {v}");
+        }
+    }
+
+    #[test]
+    fn stepping_through_every_instrument_plays_each() {
+        let mut e = engine();
+        let mut inst = InstrumentKind::GrandPiano;
+        for _ in 0..InstrumentKind::ALL.len() {
+            inst = inst.next();
+            e.params.set_instrument(inst);
+            if inst == InstrumentKind::GrandPiano {
+                continue;
+            }
+            e.handle(Event::NoteOn { key: 60, vel: 100 });
+            let out = e.render(9600);
+            assert!(rms(&out[4800..]) > 1e-3, "{} silent", inst.label());
+            e.handle(Event::NoteOff { key: 60 });
+        }
+        assert_eq!(inst, InstrumentKind::GrandPiano, "wraps around to the piano");
+        e.render(48000 * 4);
+        assert_eq!(e.synth_voices(), 0);
     }
 
 }
