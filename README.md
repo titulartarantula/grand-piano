@@ -15,7 +15,7 @@ choice is saved. Notes that are sounding when you switch ring out naturally.
 | Instrument | What it is | Presets |
 |---|---|---|
 | **Grand Piano** (default) | The sampled Salamander grand, unchanged. | — |
-| **Mono Synth (Moog-style)** | A real-time subtractive lead/bass synth in the style of the classic 1970s monosynths: 3 oscillators, 24 dB/oct ladder filter, glide. | Bass, Lead, Poly |
+| **Moog-style Synth** | A real-time subtractive synth in the style of the classic 1970s Moog-type synths: 3 oscillators, 24 dB/oct ladder filter. Plays chords (Poly, the default) or one note with legato and glide (Mono). | Bass, Lead, Poly |
 | **String Machine** | A real-time, fully polyphonic divide-down string ensemble in the style of late-1970s string synthesizers, with ensemble chorus and (on one preset) a phaser. | Strings, Phased, Dark |
 
 The synths are generated in real time: no samples are downloaded for them, and
@@ -24,22 +24,39 @@ and similar names describe a kind of instrument; this project has no connection
 with Moog Music, ARP or any other manufacturer, and their names are trademarks
 of their owners.
 
-### Mono Synth (Moog-style)
+### Moog-style Synth
+
+(Called "Mono Synth" before 2026-11-08. Older settings files still load, with Voices set to Poly: Bass and Lead used to be mono-only.)
 
 - **Oscillators:** 3 per voice, band-limited (PolyBLEP saw and square, PolyBLAMP
   triangle), slightly detuned against each other, one an octave down (Bass) or up
   (Lead).
 - **Filter:** a 4-pole, 24 dB/oct resonant ladder low-pass in zero-delay-feedback
   form with tanh saturation at its input. It stays stable at maximum resonance,
-  where it self-oscillates. It has key tracking and partial bass-loss compensation.
+  where it self-oscillates. It has partial bass-loss compensation and per-voice
+  **keyboard tracking** (75 % on Bass and Poly, 80 % on Lead): each note's cutoff
+  follows its key, so in a chord the upper notes stay bright instead of being
+  buried under a cutoff set for the bass.
 - **Envelopes:** an ADSR for the filter and one for the amp, analogue-style (RC
   attack, exponential decay and release, retrigger from the current level).
-- **Playing:** Bass and Lead are mono, last-note priority, legato (holding a key
-  while you press the next doesn't retrigger the envelopes; releasing the top key
-  falls back to the one still held) with glide. Poly is 8 voices; glide is off there.
+- **Voices: Poly / Mono.** A switch on the main screen, under the instrument
+  selector (shown only for this synth; it also has a MIDI-learn chip, so a button
+  toggles it). It works with every preset and is saved.
+  - **Poly** (default): up to 8 notes, so chords work on every preset. Each voice
+    has a fixed gain that doesn't depend on how many notes are held, so adding a
+    note never makes the others duck. Glide is off.
+  - **Mono:** one voice, legato (holding a key while you press the next doesn't
+    retrigger the envelopes; releasing the sounding key falls back to one still
+    held) with glide. **Settings → Moog-style Synth → Note priority** picks which
+    held key sounds: **Last** (default, the newest), **High** or **Low**.
+- **Analogue drift:** each note is tuned up to ±1.5 cents off, at random. Without
+  it, octave-related notes (C2 and C4) have harmonics at exactly the same
+  frequency, locked at whatever phase they started with, and can partly cancel
+  for as long as the chord is held; with it they beat slowly, as on real
+  analogue synths.
 - **Presets:** *Bass* (punchy, saw+saw+square sub, short filter decay), *Lead*
   (saw+square+saw octave, glide on), *Poly* (two detuned saws + triangle sub,
-  8 voices).
+  slower envelopes). Choosing a preset doesn't change the Voices switch.
 
 ### String Machine
 
@@ -60,7 +77,7 @@ of their owners.
 
 ### Controls per instrument
 
-| Control (default CC) | Grand Piano | Mono Synth | String Machine |
+| Control (default CC) | Grand Piano | Moog-style Synth | String Machine |
 |---|---|---|---|
 | Volume (CC7, CC11) | master volume | same | same |
 | Tone (CC74, CC71) | tone (darker / brighter) | **filter cutoff** (40 Hz–20 kHz) | **filter cutoff** |
@@ -72,13 +89,14 @@ of their owners.
 | Sustain (CC64) | pedal with half-pedal | holds notes | holds notes |
 | Pitch wheel | ignored (can be allowed in Settings) | ±2 semitones | ±2 semitones |
 | Resonance | — | ladder resonance (top = self-oscillation) | — |
-| Glide | — | portamento, 0–1.2 s (mono presets) | — |
+| Glide | — | portamento, 0–1.2 s (Mono voices only) | — |
+| Voices | — | Poly / Mono switch (button toggles) | — |
 
 Each synth keeps its own cutoff, and the piano's Tone and Shimmer settings are
 untouched while a synth is selected (on the synths the piano's tone filter and
 shimmer are bypassed). Choosing a preset loads its cutoff, resonance and glide,
-like recalling a patch. Resonance, Glide, Instrument and Preset have MIDI-learn
-chips too.
+like recalling a patch. Resonance, Glide, Voices, Instrument and Preset have
+MIDI-learn chips too.
 
 ### Pitch bend
 
@@ -86,7 +104,7 @@ The Oxygen's spring-loaded pitch wheel sends MIDI pitch bend (14-bit; centre
 8192 is no bend). The range is set per instrument in **Settings → Pitch bend**,
 0–12 semitones up and down separately, ±2 by default, with a one-click "up 2 /
 down 12" option. The synths smooth the wheel per sample (about 3 ms), so there's
-no zipper noise; on the mono synth the bend rides on top of glide. The Grand
+no zipper noise; on the Moog-style Synth in Mono the bend rides on top of glide. The Grand
 Piano ignores the wheel unless "Allow" is ticked there (it then bends the playback
 rate, for fun). A small BEND meter under the sustain bar shows the wheel.
 
@@ -178,30 +196,49 @@ around −6 dBFS. Measured by the offline render test:
 For more volume, turn Volume up (up to +6 dB). The limiter keeps the output
 clean. Fader positions, same triad (Light, velocity 64):
 
-| Fader | Gain | Piano peak / RMS | Mono Bass peak / RMS | Strings peak / RMS |
+| Fader | Gain | Piano peak / RMS | Moog-style Bass (Poly triad) peak / RMS | Strings peak / RMS |
 |---|---|---|---|---|
-| 25 % | −24.8 dB | −30.9 / −47.3 | −35.3 / −42.8 | −30.7 / −44.9 |
-| 50 % | −12.0 dB | −18.1 / −34.6 | −22.5 / −30.1 | −17.9 / −32.1 |
-| 80 % | 0 dB | −6.1 / −22.6 | −10.5 / −18.1 | −5.9 / −20.1 |
-| 100 % | +6.0 dB | −2.0 (limiter) / −17.4 | −4.5 / −12.1 | −2.0 (limiter) / −14.5 |
+| 25 % | −24.8 dB | −30.9 / −47.3 | −36.2 / −45.9 | −30.7 / −44.9 |
+| 50 % | −12.0 dB | −18.1 / −34.6 | −23.4 / −33.1 | −17.9 / −32.1 |
+| 80 % | 0 dB | −6.1 / −22.6 | −11.4 / −21.1 | −5.9 / −20.1 |
+| 100 % | +6.0 dB | −2.0 (limiter) / −17.4 | −5.4 / −15.1 | −2.0 (limiter) / −14.5 |
 
-Synth levels (first second, default volume and room; Bass plays C3, Lead C4, the
-others the C4-E4-G4 triad), peak / RMS dBFS:
+Synth levels (first second, default volume and room; Poly plays the C4-E4-G4
+triad, Mono one note: C3 on Bass, C4 otherwise), peak / RMS dBFS:
 
-| Preset | Light 40 | Light 64 | Light 100 | Normal 40 | Normal 64 | Normal 100 |
+| Preset / voices | Light 40 | Light 64 | Light 100 | Normal 40 | Normal 64 | Normal 100 |
 |---|---|---|---|---|---|---|
-| Mono Synth / Bass | −11.6 / −19.2 | −10.5 / −18.1 | −9.3 / −16.9 | −16.2 / −23.7 | −14.3 / −21.8 | −11.0 / −18.5 |
-| Mono Synth / Lead | −11.7 / −21.0 | −10.6 / −19.9 | −9.3 / −18.7 | −16.2 / −25.5 | −14.3 / −23.7 | −11.0 / −20.4 |
-| Mono Synth / Poly | −12.4 / −22.5 | −11.2 / −21.4 | −10.0 / −20.2 | −17.0 / −27.2 | −15.0 / −25.2 | −11.7 / −21.9 |
+| Moog-style Synth / Bass / Poly | −12.6 / −22.3 | −11.4 / −21.1 | −10.2 / −19.9 | −17.2 / −26.8 | −15.3 / −24.9 | −11.9 / −21.6 |
+| Moog-style Synth / Bass / Mono | −10.1 / −20.0 | −8.9 / −18.8 | −7.6 / −17.6 | −14.8 / −24.6 | −12.9 / −22.7 | −9.4 / −19.3 |
+| Moog-style Synth / Lead / Poly | −11.2 / −23.1 | −10.0 / −22.0 | −8.8 / −20.8 | −15.8 / −27.6 | −13.9 / −25.7 | −10.5 / −22.5 |
+| Moog-style Synth / Lead / Mono | −12.2 / −20.5 | −11.1 / −19.4 | −9.9 / −18.2 | −16.8 / −24.9 | −14.9 / −23.1 | −11.6 / −19.8 |
+| Moog-style Synth / Poly / Poly | −10.8 / −22.5 | −9.7 / −21.4 | −8.5 / −20.2 | −15.5 / −27.1 | −13.6 / −25.2 | −10.2 / −21.8 |
+| Moog-style Synth / Poly / Mono | −11.2 / −20.2 | −10.0 / −19.0 | −8.8 / −17.8 | −15.9 / −24.8 | −13.9 / −22.9 | −10.5 / −19.5 |
 | String Machine / Strings | −6.5 / −20.7 | −5.9 / −20.1 | −5.4 / −19.6 | −9.6 / −23.8 | −8.1 / −22.3 | −6.2 / −20.4 |
 | String Machine / Phased | −8.1 / −20.6 | −7.5 / −20.0 | −6.9 / −19.5 | −11.2 / −23.7 | −9.6 / −22.1 | −7.7 / −20.3 |
 | String Machine / Dark | −5.6 / −20.0 | −5.0 / −19.5 | −4.4 / −18.9 | −8.6 / −23.1 | −7.1 / −21.6 | −5.2 / −19.7 |
+
+Chords with a low note (Moog-style Synth, Poly, Light, velocity 100): C4-E4-G4
+held, then C2 added. Level at each note's fundamental (±2 Hz band over 2 s, dB),
+and how much the held notes change when C2 comes in. The check fails if a note
+is more than 12 dB under the loudest, a held note drops by more than 1.5 dB, or
+the limiter acts:
+
+| Preset | C2 | C4 | E4 | G4 | Spread | C4 / E4 / G4 change | Limiter |
+|---|---|---|---|---|---|---|---|
+| Bass | −42.7 | −35.2 | −34.5 | −33.3 | 9.4 | −0.2 / 0.0 / 0.0 | 0.0 |
+| Lead | −31.4 | −33.8 | −33.9 | −34.3 | 2.8 | +1.1 / +0.2 / −0.1 | 0.0 |
+| Poly | −33.5 | −34.1 | −34.1 | −34.6 | 1.1 | 0.0 / 0.0 / 0.0 | 0.0 |
+
+(The Bass C2 reads lowest because its two saws, 7 cents apart, beat slowly over
+the 2-second window; its harmonics and sub-octave carry it.)
 
 The synth render test also plays a 25-second workout through every preset (bass
 line, legato with glide, fast repeats, a cutoff sweep with resonance at maximum
 and full vibrato, the lowest and highest keys, pedalled chords, a ten-note
 fortissimo chord, quiet notes) and checks for clipping, clicks, NaN/denormal
-samples and that everything stops. Each preset renders in about 1 % of real time
+samples and that everything stops. The Moog-style Synth plays it in both Poly
+and Mono. Each preset renders in about 1 % of real time
 on one core.
 
 ## Octave, transpose and the keyboard's range
@@ -388,7 +425,7 @@ the settings and samples.
 | `src/engine.rs` | voices, damper and pedal model, release triggers, stealing, output chain |
 | `src/library.rs`, `src/sfz.rs` | SFZ parsing, FLAC/WAV decoding, lookup tables |
 | `src/dsp.rs` | tone filter, shimmer, reverb, limiter |
-| `src/synth.rs` | oscillators, ladder filter, envelopes, the mono synth and its presets |
+| `src/synth.rs` | oscillators, ladder filter, envelopes, the Moog-style synth (poly/mono, note priority) and its presets |
 | `src/strings.rs` | the string machine: divide-down oscillators, ensemble, phaser |
 | `src/metronome.rs` | beat clock and click |
 | `src/params.rs`, `src/mapping.rs` | lock-free shared parameters, velocity curves, MIDI learn |

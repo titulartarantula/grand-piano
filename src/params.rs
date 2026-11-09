@@ -52,10 +52,12 @@ pub enum Target {
     /// Button: the app's octave shift down / up (-3..+3).
     OctaveDown,
     OctaveUp,
+    /// Button: the Moog-style synth's Voices switch, Poly <-> Mono (a knob/fader picks one).
+    Voices,
 }
 
 impl Target {
-    pub const ALL: [Target; 16] = [
+    pub const ALL: [Target; 17] = [
         Target::Volume,
         Target::Tone,
         Target::Reverb,
@@ -72,6 +74,7 @@ impl Target {
         Target::TapTempo,
         Target::OctaveDown,
         Target::OctaveUp,
+        Target::Voices,
     ];
     pub fn id(self) -> u8 {
         Target::ALL.iter().position(|t| *t == self).unwrap() as u8
@@ -97,13 +100,21 @@ impl Target {
             Target::TapTempo => "Tap tempo",
             Target::OctaveDown => "Octave down",
             Target::OctaveUp => "Octave up",
+            Target::Voices => "Synth voices",
         }
     }
     /// Targets driven by a button press (127 = press) rather than a continuous value.
     pub fn is_button(self) -> bool {
         matches!(
             self,
-            Target::VelocityMode | Target::Instrument | Target::Preset | Target::MetronomeStartStop | Target::TapTempo | Target::OctaveDown | Target::OctaveUp
+            Target::VelocityMode
+                | Target::Instrument
+                | Target::Preset
+                | Target::MetronomeStartStop
+                | Target::TapTempo
+                | Target::OctaveDown
+                | Target::OctaveUp
+                | Target::Voices
         )
     }
 }
@@ -112,7 +123,9 @@ impl Target {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InstrumentKind {
     GrandPiano,
-    /// Real-time subtractive mono synth (3 oscillators, 24 dB ladder filter, glide).
+    /// Real-time Moog-style subtractive synth (3 oscillators, 24 dB ladder
+    /// filter), poly or mono with glide. (The variant name is kept so existing
+    /// settings files still load.)
     MonoSynth,
     /// Real-time divide-down string ensemble with ensemble chorus and phaser.
     StringMachine,
@@ -141,7 +154,7 @@ impl InstrumentKind {
     pub fn label(self) -> &'static str {
         match self {
             InstrumentKind::GrandPiano => "Grand Piano",
-            InstrumentKind::MonoSynth => "Mono Synth",
+            InstrumentKind::MonoSynth => "Moog-style Synth",
             InstrumentKind::StringMachine => "String Machine",
         }
     }
@@ -149,7 +162,7 @@ impl InstrumentKind {
     pub fn description(self) -> &'static str {
         match self {
             InstrumentKind::GrandPiano => "Salamander Grand · Yamaha C5",
-            InstrumentKind::MonoSynth => "Mono Synth (Moog-style) · 3 oscillators · 24 dB ladder filter",
+            InstrumentKind::MonoSynth => "Moog-style Synth · 3 oscillators · 24 dB ladder filter · Poly (chords) or Mono (legato, glide)",
             InstrumentKind::StringMachine => "String Machine · late-'70s divide-down string ensemble",
         }
     }
@@ -292,6 +305,10 @@ pub struct Params {
     pub vibrato: AtomicF32,
     pub glide: AtomicF32,
     pub resonance: AtomicF32,
+    /// Moog-style synth: Voices switch (VoiceMode id; 0 = Poly, the default)
+    /// and mono note priority (NotePriority id; 0 = Last)
+    pub synth_voices: AtomicU8,
+    pub note_priority: AtomicU8,
 
     // ---- pitch bend ----
     /// the wheel, -1..+1 (0 = centre)
@@ -369,6 +386,8 @@ impl Default for Params {
             vibrato: AtomicF32::new(0.0),
             glide: AtomicF32::new(crate::synth::MONO_PRESETS[0].glide),
             resonance: AtomicF32::new(crate::synth::MONO_PRESETS[0].resonance),
+            synth_voices: AtomicU8::new(crate::synth::VoiceMode::Poly.id()),
+            note_priority: AtomicU8::new(crate::synth::NotePriority::Last.id()),
             pitch_bend: AtomicF32::new(0.0),
             bend_up: std::array::from_fn(|_| AtomicU8::new(DEFAULT_BEND_RANGE)),
             bend_down: std::array::from_fn(|_| AtomicU8::new(DEFAULT_BEND_RANGE)),
@@ -464,6 +483,18 @@ impl Params {
             InstrumentKind::GrandPiano => {}
         }
     }
+    pub fn voice_mode(&self) -> crate::synth::VoiceMode {
+        crate::synth::VoiceMode::from_id(self.synth_voices.load(Ordering::Relaxed))
+    }
+    pub fn set_voice_mode(&self, m: crate::synth::VoiceMode) {
+        self.synth_voices.store(m.id(), Ordering::Relaxed)
+    }
+    pub fn note_priority(&self) -> crate::synth::NotePriority {
+        crate::synth::NotePriority::from_id(self.note_priority.load(Ordering::Relaxed))
+    }
+    pub fn set_note_priority(&self, pr: crate::synth::NotePriority) {
+        self.note_priority.store(pr.id(), Ordering::Relaxed)
+    }
     pub fn next_preset(&self) {
         let i = self.instrument();
         self.select_preset(i, self.preset_of(i) + 1);
@@ -546,6 +577,7 @@ impl Params {
             Target::Tempo => (self.tempo_bpm() - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN),
             Target::TapTempo => 0.0,
             Target::OctaveDown | Target::OctaveUp => (self.octave.load(Ordering::Relaxed) + 3) as f32 / 6.0,
+            Target::Voices => self.voice_mode().id() as f32,
         }
     }
     pub fn set_target(&self, t: Target, v: f32) {
@@ -577,6 +609,7 @@ impl Params {
             Target::Tempo => self.set_tempo_bpm(TEMPO_MIN + v * (TEMPO_MAX - TEMPO_MIN)),
             Target::TapTempo => {}
             Target::OctaveDown | Target::OctaveUp => self.octave.store((v * 6.0).round() as i32 - 3, Ordering::Relaxed),
+            Target::Voices => self.set_voice_mode(crate::synth::VoiceMode::from_id((v >= 0.5) as u8)),
         }
     }
     pub fn key_bit(arr: &[AtomicU64; 2], key: u8, on: bool) {

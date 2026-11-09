@@ -158,6 +158,8 @@ impl Engine {
         };
         e.current = e.params.instrument();
         e.mono.set_preset(e.params.preset_of(InstrumentKind::MonoSynth));
+        e.mono.set_voice_mode(e.params.voice_mode());
+        e.mono.set_priority(e.params.note_priority());
         e.strings.set_preset(e.params.preset_of(InstrumentKind::StringMachine));
         e
     }
@@ -187,11 +189,19 @@ impl Engine {
         if mp != self.mono.preset() {
             self.mono.set_preset(mp); // releases its notes
         }
+        self.sync_voice_mode();
         let sp = self.params.preset_of(InstrumentKind::StringMachine);
         if sp != self.strings.preset() {
             self.strings.release_all();
             self.strings.set_preset(sp);
         }
+    }
+
+    /// Follows the Voices switch and note priority (a switch releases the
+    /// synth's notes; they ring out).
+    fn sync_voice_mode(&mut self) {
+        self.mono.set_voice_mode(self.params.voice_mode());
+        self.mono.set_priority(self.params.note_priority());
     }
 
     fn synth_release_all(&mut self) {
@@ -210,7 +220,10 @@ impl Engine {
         self.params.last_velocity_in.store(raw_vel, Ordering::Relaxed);
         self.params.last_velocity_out.store(vel, Ordering::Relaxed);
         match self.current {
-            InstrumentKind::MonoSynth => self.mono.note_on(key, vel, self.params.glide.get()),
+            InstrumentKind::MonoSynth => {
+                self.sync_voice_mode();
+                self.mono.note_on(key, vel, self.params.glide.get())
+            }
             InstrumentKind::StringMachine => self.strings.note_on(key, vel),
             InstrumentKind::GrandPiano => return,
         }
@@ -856,4 +869,34 @@ mod tests {
         assert!(rms(&out) > 1e-3);
         assert!(Params::key_is(&e.params.keys_down, 60));
     }
+
+    /// Regression for "low notes cancel out higher ones": on the Moog-style
+    /// synth in Poly (the default now, on every preset), a low note added
+    /// under a held chord must not cut, retrigger or duck the held notes.
+    #[test]
+    fn synth_low_note_does_not_cut_held_chord() {
+        use crate::synth::VoiceMode;
+        for preset in 0..3 {
+            let row = crate::analysis::chord_check(Arc::new(testlib::instrument()), 48000, preset);
+            assert!(row.ok(), "preset {preset}: {row:?}");
+        }
+        // and the engine follows the Voices switch: Mono plays one note
+        let mut e = engine();
+        e.params.set_instrument(InstrumentKind::MonoSynth);
+        for k in [60u8, 64, 67, 36] {
+            e.handle(Event::NoteOn { key: k, vel: 100 });
+        }
+        assert_eq!(e.mono.active_voices(), 4);
+        for k in [60u8, 64, 67, 36] {
+            e.handle(Event::NoteOff { key: k });
+        }
+        e.render(48000 * 2);
+        e.params.set_voice_mode(VoiceMode::Mono);
+        for k in [60u8, 64, 67, 36] {
+            e.handle(Event::NoteOn { key: k, vel: 100 });
+        }
+        assert_eq!(e.mono.active_voices(), 1);
+        assert_eq!(e.mono.mono_pitch(), Some(36.0), "last-note priority by default");
+    }
+
 }

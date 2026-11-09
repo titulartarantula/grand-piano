@@ -1,4 +1,4 @@
-//! Real-time synth building blocks and the mono synth.
+//! Real-time synth building blocks and the Moog-style synth (poly or mono).
 //!
 //! Everything here runs on the audio thread: no allocation, no locks.
 //!
@@ -12,6 +12,7 @@
 //! - Denormals: filter states and envelopes are flushed to zero when they
 //!   become tiny, and idle voices are skipped.
 
+use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
 // ------------------------------------------------------------ building blocks
@@ -280,12 +281,78 @@ pub const VIBRATO_HZ: f32 = 5.6;
 
 // ------------------------------------------------------------ mono synth
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How many notes the synth plays at once. Chosen on the main screen,
+/// independent of the preset (every preset can play either way).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoiceMode {
-    /// One voice, last-note priority, legato (no retrigger while a key is held), glide.
-    Mono,
-    /// Up to POLY_VOICES voices; glide is off.
+    /// Up to POLY_VOICES voices: chords work. Glide is off. The default.
+    #[default]
     Poly,
+    /// One voice, legato (no retrigger while a key is held), with glide. Which
+    /// held key sounds is set by the note priority.
+    Mono,
+}
+
+impl VoiceMode {
+    pub const ALL: [VoiceMode; 2] = [VoiceMode::Poly, VoiceMode::Mono];
+    pub fn id(self) -> u8 {
+        match self {
+            VoiceMode::Poly => 0,
+            VoiceMode::Mono => 1,
+        }
+    }
+    pub fn from_id(id: u8) -> VoiceMode {
+        if id == 1 { VoiceMode::Mono } else { VoiceMode::Poly }
+    }
+    pub fn toggled(self) -> VoiceMode {
+        match self {
+            VoiceMode::Poly => VoiceMode::Mono,
+            VoiceMode::Mono => VoiceMode::Poly,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            VoiceMode::Poly => "Poly",
+            VoiceMode::Mono => "Mono",
+        }
+    }
+}
+
+/// Which held key the mono voice plays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotePriority {
+    /// The most recently pressed key (releasing it falls back to the previous one).
+    #[default]
+    Last,
+    /// The highest held key (good for leads over a held bass note).
+    High,
+    /// The lowest held key (the classic Minimoog-style bass behaviour).
+    Low,
+}
+
+impl NotePriority {
+    pub const ALL: [NotePriority; 3] = [NotePriority::Last, NotePriority::High, NotePriority::Low];
+    pub fn id(self) -> u8 {
+        match self {
+            NotePriority::Last => 0,
+            NotePriority::High => 1,
+            NotePriority::Low => 2,
+        }
+    }
+    pub fn from_id(id: u8) -> NotePriority {
+        match id {
+            1 => NotePriority::High,
+            2 => NotePriority::Low,
+            _ => NotePriority::Last,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            NotePriority::Last => "Last",
+            NotePriority::High => "High",
+            NotePriority::Low => "Low",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -303,7 +370,6 @@ pub struct MonoPreset {
     pub name: &'static str,
     pub osc: [OscSpec; 3],
     pub noise: f32,
-    pub mode: VoiceMode,
     /// filter envelope amount in octaves
     pub env_amount: f32,
     /// filter keyboard tracking (1 = cutoff follows the key exactly)
@@ -316,8 +382,12 @@ pub struct MonoPreset {
     pub cutoff: f32,
     pub resonance: f32,
     pub glide: f32,
-    /// output gain
+    /// output gain in Mono voice mode (one note)
     pub gain: f32,
+    /// per-voice output gain in Poly voice mode. Fixed (it never depends on how
+    /// many notes are held), so adding a note never makes the others duck;
+    /// chosen so a triad sits at about the same level as one mono note.
+    pub poly_gain: f32,
 }
 
 pub const MONO_PRESETS: [MonoPreset; 3] = [
@@ -329,9 +399,8 @@ pub const MONO_PRESETS: [MonoPreset; 3] = [
             OscSpec { wave: Wave::Square, semis: -12.0, cents: -4.0, level: 0.6 },
         ],
         noise: 0.0,
-        mode: VoiceMode::Mono,
         env_amount: 3.2,
-        key_track: 0.5,
+        key_track: 0.75,
         drive: 0.75,
         filter_env: AdsrTimes { attack: 0.001, decay: 0.24, sustain: 0.18, release: 0.12 },
         amp_env: AdsrTimes { attack: 0.002, decay: 0.7, sustain: 0.8, release: 0.07 },
@@ -339,6 +408,7 @@ pub const MONO_PRESETS: [MonoPreset; 3] = [
         resonance: 0.28,
         glide: 0.0,
         gain: 0.95,
+        poly_gain: 0.4,
     },
     MonoPreset {
         name: "Lead",
@@ -348,9 +418,8 @@ pub const MONO_PRESETS: [MonoPreset; 3] = [
             OscSpec { wave: Wave::Saw, semis: 12.0, cents: -5.0, level: 0.4 },
         ],
         noise: 0.0,
-        mode: VoiceMode::Mono,
         env_amount: 2.0,
-        key_track: 0.7,
+        key_track: 0.8,
         drive: 0.7,
         filter_env: AdsrTimes { attack: 0.008, decay: 0.7, sustain: 0.45, release: 0.3 },
         amp_env: AdsrTimes { attack: 0.004, decay: 1.0, sustain: 1.0, release: 0.18 },
@@ -358,6 +427,7 @@ pub const MONO_PRESETS: [MonoPreset; 3] = [
         resonance: 0.38,
         glide: 0.35,
         gain: 0.8,
+        poly_gain: 0.34,
     },
     MonoPreset {
         name: "Poly",
@@ -367,16 +437,16 @@ pub const MONO_PRESETS: [MonoPreset; 3] = [
             OscSpec { wave: Wave::Triangle, semis: -12.0, cents: 0.0, level: 0.5 },
         ],
         noise: 0.0,
-        mode: VoiceMode::Poly,
         env_amount: 1.8,
-        key_track: 0.6,
+        key_track: 0.75,
         drive: 0.55,
         filter_env: AdsrTimes { attack: 0.03, decay: 0.9, sustain: 0.4, release: 0.4 },
         amp_env: AdsrTimes { attack: 0.012, decay: 1.2, sustain: 0.85, release: 0.45 },
         cutoff: 0.48,
         resonance: 0.15,
         glide: 0.0,
-        gain: 0.5,
+        gain: 1.2,
+        poly_gain: 0.5,
     },
 ];
 
@@ -391,6 +461,11 @@ struct SynthVoice {
     target: f32,
     bend: f32,
     vel: f32,
+    /// small per-note tuning offset (frequency ratio), like an analogue
+    /// voice's drift: keeps octave-related notes' coinciding harmonics from
+    /// locking at a fixed phase, where they could partly cancel for as long
+    /// as the chord is held (they beat slowly instead)
+    drift: f32,
     phase: [f32; 3],
     filter: Ladder,
     amp: Adsr,
@@ -407,6 +482,7 @@ impl SynthVoice {
         target: 60.0,
         bend: 0.0,
         vel: 0.0,
+        drift: 1.0,
         phase: [0.0; 3],
         filter: Ladder { s: [0.0; 4] },
         amp: Adsr { level: 0.0, stage: Stage::Idle, att: 1.0, dec: 1.0, rel: 1.0, sus: 1.0 },
@@ -431,12 +507,16 @@ pub struct MonoControls {
     pub bend: f32,
 }
 
-/// The Minimoog-style mono synth (with an optional poly mode via presets).
+/// The Moog-style synth: poly (chords) or mono (one voice, legato, glide).
 pub struct MonoSynth {
     sr: f32,
     preset: usize,
+    mode: VoiceMode,
+    priority: NotePriority,
+    /// a panic shortened the envelopes; restore them once everything is silent
+    panicked: bool,
     voices: [SynthVoice; POLY_VOICES],
-    /// held keys, oldest first (last-note priority)
+    /// held keys in mono mode, oldest first
     stack: [u8; 16],
     stack_len: usize,
     pedal: bool,
@@ -454,11 +534,21 @@ pub struct MonoSynth {
     last_pitch: f32,
 }
 
+/// Maximum analogue-style tuning drift per note, in cents (±).
+pub const DRIFT_CENTS: f32 = 1.5;
+
+fn drift_ratio(r: &mut Rng) -> f32 {
+    2f32.powf(r.next_f32() * DRIFT_CENTS / 1200.0)
+}
+
 impl MonoSynth {
     pub fn new(sr: f32) -> Self {
         let mut s = MonoSynth {
             sr,
             preset: 0,
+            mode: VoiceMode::Poly,
+            priority: NotePriority::Last,
+            panicked: false,
             voices: [SynthVoice::EMPTY; POLY_VOICES],
             stack: [0; 16],
             stack_len: 0,
@@ -482,6 +572,51 @@ impl MonoSynth {
 
     fn p(&self) -> &'static MonoPreset {
         &MONO_PRESETS[self.preset]
+    }
+
+    pub fn voice_mode(&self) -> VoiceMode {
+        self.mode
+    }
+
+    /// Switches between Poly and Mono. Sounding notes are released first (they
+    /// ring out), so no voice is left stuck when the other mode takes over.
+    pub fn set_voice_mode(&mut self, m: VoiceMode) {
+        if m != self.mode {
+            self.release_all();
+            self.mode = m;
+        }
+    }
+
+    pub fn priority(&self) -> NotePriority {
+        self.priority
+    }
+
+    /// Note priority for Mono mode. Takes effect at once if keys are held.
+    pub fn set_priority(&mut self, pr: NotePriority) {
+        if pr == self.priority {
+            return;
+        }
+        self.priority = pr;
+        if self.mode == VoiceMode::Mono && self.stack_len > 0 {
+            let k = self.pick();
+            let v = &mut self.voices[0];
+            if v.active && v.key != k {
+                let cur = v.target + v.bend;
+                v.key = k;
+                v.target = k as f32;
+                v.bend = cur - k as f32;
+            }
+        }
+    }
+
+    /// The held key that should sound in mono mode (stack must not be empty).
+    fn pick(&self) -> u8 {
+        let held = &self.stack[..self.stack_len];
+        match self.priority {
+            NotePriority::Last => held[held.len() - 1],
+            NotePriority::High => *held.iter().max().unwrap(),
+            NotePriority::Low => *held.iter().min().unwrap(),
+        }
     }
 
     /// Switches preset. Sounding notes are released first.
@@ -534,11 +669,16 @@ impl MonoSynth {
     pub fn note_on(&mut self, key: u8, vel: u8, glide_pos: f32) {
         let vn = vel as f32 / 127.0;
         self.clock += 1;
-        match self.p().mode {
+        match self.mode {
             VoiceMode::Mono => {
                 let legato = self.stack_len > 0;
                 self.stack_push(key);
+                let key = self.pick();
                 let v = &mut self.voices[0];
+                if legato && v.active && v.key == key {
+                    // e.g. High priority and a lower key: the sounding note carries on
+                    return;
+                }
                 let sounding = v.active && v.amp.level > 1e-3;
                 let cur = v.target + v.bend;
                 v.key = key;
@@ -549,6 +689,7 @@ impl MonoSynth {
                 if !legato {
                     // a new phrase: retrigger both envelopes from their current level
                     v.vel = vn;
+                    v.drift = drift_ratio(&mut self.rng);
                     v.amp.gate_on();
                     v.fenv.gate_on();
                     if !v.active {
@@ -588,6 +729,7 @@ impl MonoSynth {
                 v.target = key as f32;
                 v.bend = 0.0;
                 v.vel = vn;
+                v.drift = drift_ratio(&mut self.rng);
                 v.sustained = false;
                 v.age = self.clock;
                 v.amp.gate_on();
@@ -597,22 +739,27 @@ impl MonoSynth {
     }
 
     pub fn note_off(&mut self, key: u8) {
-        match self.p().mode {
+        match self.mode {
             VoiceMode::Mono => {
-                let was_top = self.stack_len > 0 && self.stack[self.stack_len - 1] == key;
-                self.stack_remove(key);
-                if !was_top {
+                if !self.stack[..self.stack_len].contains(&key) {
                     return;
                 }
-                let v = &mut self.voices[0];
+                self.stack_remove(key);
                 if self.stack_len > 0 {
-                    // fall back to the previous held key (legato, glides if glide is on)
-                    let k = self.stack[self.stack_len - 1];
+                    // fall back to the held key the priority picks (legato, glides if glide is on)
+                    let k = self.pick();
+                    let v = &mut self.voices[0];
+                    if v.key == k {
+                        return; // released a key that wasn't sounding
+                    }
                     let cur = v.target + v.bend;
                     v.key = k;
                     v.target = k as f32;
                     v.bend = cur - k as f32;
-                } else if self.pedal {
+                    return;
+                }
+                let v = &mut self.voices[0];
+                if self.pedal {
                     v.sustained = true;
                 } else {
                     v.amp.gate_off();
@@ -638,7 +785,7 @@ impl MonoSynth {
         self.pedal = down;
         if !down {
             let held = self.stack_len > 0;
-            let mono = self.p().mode == VoiceMode::Mono;
+            let mono = self.mode == VoiceMode::Mono;
             for v in self.voices.iter_mut().filter(|v| v.sustained) {
                 v.sustained = false;
                 if !(mono && held) {
@@ -661,6 +808,7 @@ impl MonoSynth {
     /// Fast fade of everything (panic): a 10 ms release.
     pub fn panic(&mut self) {
         self.stack_len = 0;
+        self.panicked = true;
         let t = AdsrTimes { attack: 0.01, decay: 0.01, sustain: 0.0, release: 0.01 };
         for v in self.voices.iter_mut() {
             v.sustained = false;
@@ -691,6 +839,16 @@ impl MonoSynth {
         // 14-bit steps and the message rate never cause zipper noise
         let bend_a = 1.0 - (-1.0 / (0.003 * self.sr)).exp();
         if !self.voices.iter().any(|v| v.active) {
+            if self.panicked {
+                // the 10 ms panic fade is done: restore the preset's envelopes
+                self.panicked = false;
+                let p = self.p();
+                let sr = self.sr;
+                for v in self.voices.iter_mut() {
+                    v.amp.set(&p.amp_env, sr);
+                    v.fenv.set(&p.filter_env, sr);
+                }
+            }
             // keep the vibrato LFO running so it doesn't restart in sync with notes
             self.vib_phase = (self.vib_phase + VIBRATO_HZ * n as f32 / self.sr).fract();
             self.bend_s = c.bend;
@@ -718,13 +876,16 @@ impl MonoSynth {
         let k1 = resonance_k(self.res_s);
         let glide_t = glide_secs(c.glide);
         // bend multiplier per sample: ~98 % of the way after the glide time
-        let glide_keep = if p.mode == VoiceMode::Mono && glide_t > 0.0 { (-1.0 / (glide_t / 4.0 * sr)).exp() } else { 0.0 };
+        let mono = self.mode == VoiceMode::Mono;
+        let glide_keep = if mono && glide_t > 0.0 { (-1.0 / (glide_t / 4.0 * sr)).exp() } else { 0.0 };
         let vib_depth = vibrato_semis(c.vibrato);
         let vib_inc = VIBRATO_HZ * inv_sr;
         let nyq = 0.45 * sr;
         let mut vib_phase = self.vib_phase;
         let ratio = self.ratio;
         let inv_n = 1.0 / n as f32;
+        // fixed per-voice gain: never depends on how many voices are sounding
+        let gain = if mono { p.gain } else { p.poly_gain };
         for (vi, v) in self.voices.iter_mut().enumerate().filter(|(_, v)| v.active) {
             let mut ph = vib_phase;
             let mut bend = bend0;
@@ -743,7 +904,7 @@ impl MonoSynth {
                 if ph >= 1.0 {
                     ph -= 1.0;
                 }
-                let base = 440.0 * exp2((pitch + vib - 69.0) / 12.0);
+                let base = 440.0 * exp2((pitch + vib - 69.0) / 12.0) * v.drift;
                 let aenv = v.amp.tick();
                 let fenv = v.fenv.tick();
                 // oscillators
@@ -764,7 +925,7 @@ impl MonoSynth {
                 let g = fast_tan(PI * fc * inv_sr);
                 let k = k0 + (k1 - k0) * f;
                 let y = v.filter.tick(mix * 0.42 * p.drive, g, k);
-                let s = y * aenv * vel_amp * p.gain;
+                let s = y * aenv * vel_amp * gain;
                 out[i * 2] += s;
                 out[i * 2 + 1] += s;
             }
@@ -945,7 +1106,8 @@ mod tests {
     #[test]
     fn legato_does_not_retrigger_and_glides() {
         let mut s = MonoSynth::new(SR);
-        s.set_preset(1); // Lead: mono
+        s.set_preset(1); // Lead
+        s.set_voice_mode(VoiceMode::Mono);
         let c = MonoControls { glide: 0.5, ..controls() }; // 0.3 s
         s.note_on(60, 100, c.glide);
         run(&mut s, 4800, c);
@@ -980,6 +1142,7 @@ mod tests {
     fn pitch_bend_is_smooth_and_works_during_glide() {
         let mut s = MonoSynth::new(SR);
         s.set_preset(1);
+        s.set_voice_mode(VoiceMode::Mono);
         let mut c = MonoControls { glide: 0.6, ..controls() };
         s.note_on(60, 100, c.glide);
         run(&mut s, 4800, c);
@@ -1012,6 +1175,7 @@ mod tests {
     fn zero_glide_jumps() {
         let mut s = MonoSynth::new(SR);
         s.set_preset(0);
+        s.set_voice_mode(VoiceMode::Mono);
         let c = controls();
         s.note_on(40, 100, 0.0);
         run(&mut s, 960, c);
@@ -1025,6 +1189,7 @@ mod tests {
     fn last_note_priority_with_three_keys() {
         let mut s = MonoSynth::new(SR);
         s.set_preset(0);
+        s.set_voice_mode(VoiceMode::Mono);
         for k in [48, 52, 55] {
             s.note_on(k, 90, 0.0);
         }
@@ -1039,6 +1204,7 @@ mod tests {
     fn sustain_pedal_holds_mono_note() {
         let mut s = MonoSynth::new(SR);
         s.set_preset(0);
+        s.set_voice_mode(VoiceMode::Mono);
         s.sustain(true);
         s.note_on(48, 90, 0.0);
         s.note_off(48);
@@ -1049,9 +1215,10 @@ mod tests {
 
     #[test]
     fn output_is_finite_and_free_of_denormals() {
-        for preset in 0..MONO_PRESETS.len() {
+        for (preset, mode) in (0..MONO_PRESETS.len()).flat_map(|p| VoiceMode::ALL.map(|m| (p, m))) {
             let mut s = MonoSynth::new(SR);
             s.set_preset(preset);
+            s.set_voice_mode(mode);
             let mut c = MonoControls { cutoff: 1.0, resonance: 1.0, glide: 0.3, vibrato: 1.0, bend: 12.0 };
             for k in [24u8, 36, 60, 96, 108, 127, 0] {
                 s.note_on(k, 127, c.glide);
@@ -1076,17 +1243,235 @@ mod tests {
 
     #[test]
     fn poly_mode_plays_chords_and_steals() {
+        for preset in 0..MONO_PRESETS.len() {
+            let mut s = MonoSynth::new(SR);
+            s.set_preset(preset);
+            assert_eq!(s.voice_mode(), VoiceMode::Poly, "Poly is the default on every preset");
+            for k in [60, 64, 67] {
+                s.note_on(k, 100, 0.0);
+            }
+            assert_eq!(s.active_voices(), 3);
+            for k in 70..90 {
+                s.note_on(k, 100, 0.0);
+            }
+            assert_eq!(s.active_voices(), POLY_VOICES);
+            let out = run(&mut s, 4800, controls());
+            assert_clean(&out);
+        }
+    }
+
+    use crate::analysis::band_db;
+
+    fn lvl(buf: &[f32], f: f32) -> f32 {
+        band_db(buf, SR, f, 2.0)
+    }
+
+    fn hz(key: u8) -> f32 {
+        440.0 * 2f32.powf((key as f32 - 69.0) / 12.0)
+    }
+
+    const CHORD: [u8; 4] = [36, 60, 64, 67]; // C2 + C4 E4 G4
+
+    /// Renders `keys` (pressed in that order) on `preset` in Poly at the preset's
+    /// own cutoff/resonance, and returns 2 s of output after a 0.25 s settle.
+    fn render_chord(preset: usize, keys: &[u8]) -> Vec<f32> {
+        let p = &MONO_PRESETS[preset];
+        let c = MonoControls { cutoff: p.cutoff, resonance: p.resonance, glide: p.glide, vibrato: 0.0, bend: 0.0 };
         let mut s = MonoSynth::new(SR);
-        s.set_preset(2);
-        for k in [60, 64, 67] {
+        s.set_preset(preset);
+        for &k in keys {
+            s.note_on(k, 100, c.glide);
+        }
+        run(&mut s, 12000, c);
+        run(&mut s, 96000, c)
+    }
+
+    #[test]
+    fn poly_chord_with_low_note_keeps_every_note_audible() {
+        for preset in 0..MONO_PRESETS.len() {
+            let out = render_chord(preset, &CHORD);
+            assert_clean(&out);
+            let lv: Vec<f32> = CHORD.iter().map(|k| lvl(&out, hz(*k))).collect();
+            let top = lv.iter().cloned().fold(f32::MIN, f32::max);
+            for (k, l) in CHORD.iter().zip(&lv) {
+                assert!(top - l < 12.0, "{}: key {k} at {l:.1} dB, {:.1} dB under the loudest ({lv:?})", MONO_PRESETS[preset].name, top - l);
+            }
+            // and the low note doesn't mask the upper ones: each upper note is
+            // about as strong in the chord as when it's played on its own
+            for &k in &CHORD[1..] {
+                let alone = lvl(&render_chord(preset, &[k]), hz(k));
+                let inchord = lvl(&out, hz(k));
+                assert!(inchord > alone - 3.0, "{}: key {k} {inchord:.1} dB in the chord vs {alone:.1} alone", MONO_PRESETS[preset].name);
+            }
+        }
+    }
+
+    #[test]
+    fn key_tracking_keeps_high_notes_bright() {
+        // With key tracking each voice's filter follows its key, so a C4 keeps
+        // roughly the timbre of a C2 instead of being buried under a cutoff set
+        // for the bass. Brightness = 3rd harmonic relative to the fundamental.
+        // Without tracking, C4's 3rd harmonic would sit ~2 octaves further up
+        // the 24 dB/oct slope than C2's (about 48 dB darker).
+        for (preset, p) in MONO_PRESETS.iter().enumerate() {
+            assert!((0.5..=1.0).contains(&p.key_track), "{} key_track {}", p.name, p.key_track);
+            let bright = |k: u8| {
+                let out = render_chord(preset, &[k]);
+                lvl(&out, 3.0 * hz(k)) - lvl(&out, hz(k))
+            };
+            let (low, high) = (bright(36), bright(60));
+            assert!(high > low - 20.0, "{}: C4 brightness {high:.1} dB vs C2 {low:.1} dB", p.name);
+        }
+    }
+
+    #[test]
+    fn notes_in_any_order_give_the_same_voices() {
+        // all 24 orders of the chord
+        let mut orders = Vec::new();
+        let k = CHORD;
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let idx = [a, b, c, d];
+                        if (0..4).all(|i| idx.contains(&i)) {
+                            orders.push(idx.map(|i| k[i]));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(orders.len(), 24);
+        for preset in 0..MONO_PRESETS.len() {
+            let mut want: Option<[u64; 2]> = None;
+            for o in &orders {
+                let mut s = MonoSynth::new(SR);
+                s.set_preset(preset);
+                for &key in o {
+                    s.note_on(key, 100, 0.0);
+                }
+                run(&mut s, 960, controls());
+                assert_eq!(s.active_voices(), 4, "{o:?}");
+                let mut bits = [0u64; 2];
+                s.sounding(&mut bits);
+                if let Some(w) = want {
+                    assert_eq!(bits, w, "order {o:?}");
+                } else {
+                    want = Some(bits);
+                }
+                let mut keys: Vec<u8> = s.voices.iter().filter(|v| v.active).map(|v| v.key).collect();
+                keys.sort();
+                assert_eq!(keys, vec![36, 60, 64, 67]);
+            }
+            // in mono, High and Low pick the same key whatever the order
+            for (pr, want_key) in [(NotePriority::High, 67u8), (NotePriority::Low, 36)] {
+                for o in &orders {
+                    let mut s = MonoSynth::new(SR);
+                    s.set_preset(preset);
+                    s.set_voice_mode(VoiceMode::Mono);
+                    s.set_priority(pr);
+                    for &key in o {
+                        s.note_on(key, 100, 0.0);
+                    }
+                    assert_eq!(s.mono_pitch(), Some(want_key as f32), "{pr:?} {o:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mono_note_priorities() {
+        let c = controls();
+        // Last (default): the newest key, falling back in order
+        let mut s = MonoSynth::new(SR);
+        s.set_voice_mode(VoiceMode::Mono);
+        assert_eq!(s.priority(), NotePriority::Last);
+        for k in [48, 60, 55] {
             s.note_on(k, 100, 0.0);
         }
-        assert_eq!(s.active_voices(), 3);
-        for k in 70..90 {
+        assert_eq!(s.mono_pitch(), Some(55.0));
+        s.note_off(55);
+        run(&mut s, 64, c); // glide off: the fall-back jumps within a block
+        assert_eq!(s.mono_pitch(), Some(60.0));
+
+        // High: a lower key under a held high one changes nothing (no retrigger)
+        let mut s = MonoSynth::new(SR);
+        s.set_voice_mode(VoiceMode::Mono);
+        s.set_priority(NotePriority::High);
+        s.note_on(60, 100, 0.0);
+        run(&mut s, 4800, c);
+        s.note_on(48, 100, 0.0);
+        assert_eq!(s.mono_pitch(), Some(60.0));
+        assert_ne!(s.mono_amp_stage(), Stage::Attack);
+        s.note_on(67, 100, 0.0);
+        assert_eq!(s.mono_pitch(), Some(67.0));
+        assert_ne!(s.mono_amp_stage(), Stage::Attack, "legato");
+        s.note_off(48); // not sounding
+        assert_eq!(s.mono_pitch(), Some(67.0));
+        s.note_off(67);
+        run(&mut s, 64, c);
+        assert_eq!(s.mono_pitch(), Some(60.0), "falls back to the highest still held");
+        s.note_off(60);
+        assert_eq!(s.mono_amp_stage(), Stage::Release);
+
+        // Low: the bass note holds while higher keys come and go
+        let mut s = MonoSynth::new(SR);
+        s.set_voice_mode(VoiceMode::Mono);
+        s.set_priority(NotePriority::Low);
+        s.note_on(48, 100, 0.0);
+        s.note_on(60, 100, 0.0);
+        assert_eq!(s.mono_pitch(), Some(48.0));
+        s.note_on(36, 100, 0.0);
+        assert_eq!(s.mono_pitch(), Some(36.0));
+        s.note_off(36);
+        run(&mut s, 64, c);
+        assert_eq!(s.mono_pitch(), Some(48.0));
+        // switching priority while keys are held takes effect at once
+        s.set_priority(NotePriority::High);
+        run(&mut s, 64, c);
+        assert_eq!(s.mono_pitch(), Some(60.0));
+    }
+
+    #[test]
+    fn switching_voice_mode_releases_notes_and_leaves_nothing_stuck() {
+        let c = controls();
+        let mut s = MonoSynth::new(SR);
+        for k in CHORD {
             s.note_on(k, 100, 0.0);
         }
-        assert_eq!(s.active_voices(), POLY_VOICES);
-        let out = run(&mut s, 4800, controls());
-        assert_clean(&out);
+        s.set_voice_mode(VoiceMode::Mono);
+        // the keys are released by the player later: nothing must hang
+        for k in CHORD {
+            s.note_off(k);
+        }
+        run(&mut s, 48000 * 2, c);
+        assert_eq!(s.active_voices(), 0);
+        s.note_on(40, 100, 0.0);
+        s.note_on(52, 100, 0.0);
+        assert_eq!(s.active_voices(), 1, "mono: one voice");
+        s.set_voice_mode(VoiceMode::Poly);
+        s.note_off(40);
+        s.note_off(52);
+        run(&mut s, 48000 * 2, c);
+        assert_eq!(s.active_voices(), 0);
+    }
+
+    /// Regression: a panic shortened the envelopes to 10 ms for good, so every
+    /// later note died away at once. They are now restored when the fade ends.
+    #[test]
+    fn panic_restores_envelopes() {
+        let c = controls();
+        let mut s = MonoSynth::new(SR);
+        s.note_on(60, 100, 0.0);
+        run(&mut s, 4800, c);
+        s.panic();
+        run(&mut s, 4800, c);
+        assert_eq!(s.active_voices(), 0);
+        run(&mut s, 128, c);
+        s.note_on(60, 100, 0.0);
+        let out = run(&mut s, 48000, c);
+        let late = &out[out.len() - 9600..];
+        let rms = (late.iter().map(|x| x * x).sum::<f32>() / late.len() as f32).sqrt();
+        assert!(rms > 0.01, "held note still sounding after 1 s (rms {rms})");
     }
 }

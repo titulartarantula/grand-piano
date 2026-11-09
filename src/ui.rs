@@ -11,6 +11,7 @@ use grand_piano::library::{self, Instrument, LoadProgress};
 use grand_piano::mapping::Mapper;
 use grand_piano::params::{self, InstrumentKind, Params, Target, VelocityMode};
 use grand_piano::settings::{AudioMode, Settings};
+use grand_piano::synth::{NotePriority, VoiceMode};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -325,7 +326,9 @@ impl App {
         let left = Rect::from_min_max(mid.min, pos2(metro.min.x - 14.0, mid.max.y));
         ui.painter().rect_filled(left, CornerRadius::same(18), PANEL);
         ui.painter().rect_filled(metro, CornerRadius::same(18), PANEL);
-        let strip = Rect::from_min_size(left.min, vec2(left.width(), 72.0));
+        // the Moog-style synth gets a second row for its Voices switch
+        let strip_h = if self.params.instrument() == InstrumentKind::MonoSynth { 108.0 } else { 72.0 };
+        let strip = Rect::from_min_size(left.min, vec2(left.width(), strip_h));
         self.instrument_strip(ui, strip);
         let row_h = 104.0;
         let knob_area = Rect::from_min_max(pos2(left.min.x, strip.max.y), pos2(left.max.x, (left.max.y - row_h).max(strip.max.y + 120.0)));
@@ -429,7 +432,12 @@ impl App {
             } else if resp.hovered() {
                 p.rect_filled(sr.shrink(3.0), CornerRadius::same(14), LINE);
             }
-            p.text(sr.center(), Align2::CENTER_CENTER, k.label(), FontId::proportional(14.0), if sel { BG } else { TEXT });
+            // shrink the label if it doesn't fit the segment (narrow windows)
+            let mut size = 14.0;
+            while size > 11.0 && p.layout_no_wrap(k.label().to_string(), FontId::proportional(size), TEXT).size().x > seg - 12.0 {
+                size -= 0.5;
+            }
+            p.text(sr.center(), Align2::CENTER_CENTER, k.label(), FontId::proportional(size), if sel { BG } else { TEXT });
             if resp.clicked() {
                 self.params.set_instrument(*k);
                 self.dirty = true;
@@ -437,6 +445,9 @@ impl App {
             resp.on_hover_text(k.description());
         }
         self.mapping_chip(ui, pos2(total.center().x, total.max.y + 15.0), Target::Instrument);
+        if cur == InstrumentKind::MonoSynth {
+            self.voices_row(ui, Rect::from_min_max(pos2(r.min.x + pad, r.min.y + 76.0), pos2(r.max.x - pad, r.min.y + 106.0)));
+        }
         let names = cur.presets();
         if names.is_empty() {
             return;
@@ -465,6 +476,52 @@ impl App {
             }
         }
         self.mapping_chip(ui, pos2(ptotal.center().x, ptotal.max.y + 15.0), Target::Preset);
+    }
+
+    /// The Moog-style synth's Voices switch: Poly (chords) / Mono (one note,
+    /// legato, glide), with its MIDI-learn chip and a one-line explanation.
+    fn voices_row(&mut self, ui: &mut egui::Ui, r: Rect) {
+        let p = ui.painter().clone();
+        let cy = r.center().y;
+        spaced(&p, pos2(r.min.x, cy), "VOICES", 11.0, MUTED, Align2::LEFT_CENTER);
+        let seg = 78.0;
+        let total = Rect::from_min_size(pos2(r.min.x + 64.0, r.min.y), vec2(seg * 2.0, r.height()));
+        p.rect_filled(total, CornerRadius::same(15), RAISED);
+        let cur = self.params.voice_mode();
+        for (i, m) in VoiceMode::ALL.iter().enumerate() {
+            let sr = Rect::from_min_size(pos2(total.min.x + seg * i as f32, total.min.y), vec2(seg, r.height()));
+            let resp = ui.interact(sr, ui.make_persistent_id(("voices", i)), Sense::click());
+            let sel = *m == cur;
+            if sel {
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(12), ACCENT);
+            } else if resp.hovered() {
+                p.rect_filled(sr.shrink(3.0), CornerRadius::same(12), LINE);
+            }
+            p.text(sr.center(), Align2::CENTER_CENTER, m.label(), FontId::proportional(14.0), if sel { BG } else { TEXT });
+            if resp.clicked() {
+                self.params.set_voice_mode(*m);
+                self.dirty = true;
+            }
+            resp.on_hover_text(match m {
+                VoiceMode::Poly => "Poly: up to 8 notes at once, so chords work. Glide is off.",
+                VoiceMode::Mono => "Mono: one note at a time, legato, with glide. Which held key sounds is set by Note priority in Settings.",
+            });
+        }
+        let chip_x = total.max.x + 44.0;
+        self.mapping_chip(ui, pos2(chip_x, cy), Target::Voices);
+        let hint = match cur {
+            VoiceMode::Poly => "Chords: every key sounds.",
+            VoiceMode::Mono => match self.params.note_priority() {
+                NotePriority::Last => "One note: the last key pressed wins (legato, glide).",
+                NotePriority::High => "One note: the highest held key wins (legato, glide).",
+                NotePriority::Low => "One note: the lowest held key wins (legato, glide).",
+            },
+        };
+        let tx = chip_x + 50.0;
+        if tx + 120.0 < r.max.x {
+            let g = p.layout(hint.to_string(), FontId::proportional(12.5), MUTED, r.max.x - tx);
+            p.galley(pos2(tx, cy - g.size().y / 2.0), g, MUTED);
+        }
     }
 
     /// The beat light's brightness (0..1) and the beat-in-bar to show, from the
@@ -1099,6 +1156,30 @@ impl App {
                     ui.label(egui::RichText::new("Added to the octave shift (main screen); both apply to notes from the keyboard.").color(MUTED).size(12.0));
                 });
 
+                section(ui, "MOOG-STYLE SYNTH");
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(110.0, 18.0), egui::Label::new(egui::RichText::new("Voices").color(TEXT)));
+                    let cur = self.params.voice_mode();
+                    for m in VoiceMode::ALL {
+                        if ui.selectable_label(cur == m, m.label()).clicked() {
+                            self.params.set_voice_mode(m);
+                            self.dirty = true;
+                        }
+                    }
+                    ui.label(egui::RichText::new("Also on the main screen. Poly plays chords; Mono is one note with legato and glide.").color(MUTED).size(12.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized(vec2(110.0, 18.0), egui::Label::new(egui::RichText::new("Note priority").color(TEXT)));
+                    let cur = self.params.note_priority();
+                    for pr in NotePriority::ALL {
+                        if ui.selectable_label(cur == pr, pr.label()).clicked() {
+                            self.params.set_note_priority(pr);
+                            self.dirty = true;
+                        }
+                    }
+                    ui.label(egui::RichText::new("Mono only: which held key sounds (Last = newest, High = highest, Low = lowest).").color(MUTED).size(12.0));
+                });
+
                 section(ui, "PITCH BEND");
                 for inst in InstrumentKind::ALL {
                     let i = inst.id() as usize;
@@ -1197,7 +1278,7 @@ impl App {
                     ui.label(egui::RichText::new(format!("{} samples loaded · {} MB in memory · 16 velocity layers · release samples", i.samples.len(), i.memory_bytes / 1_000_000)).color(MUTED).size(12.0));
                 }
                 ui.label(egui::RichText::new("Shimmer (mod wheel): a stereo chorus whose depth and mix follow the wheel, with a gentle stereo tremolo in the top half.").color(MUTED).size(12.0));
-                ui.label(egui::RichText::new("Mono Synth and String Machine are synthesized in real time (no samples). On the synths, Tone is the filter cutoff and the mod wheel adds vibrato. \"Moog-style\" describes the kind of synth; this app has no connection with Moog Music.").color(MUTED).size(12.0));
+                ui.label(egui::RichText::new("The Moog-style Synth and String Machine are synthesized in real time (no samples). On the synths, Tone is the filter cutoff and the mod wheel adds vibrato. The Moog-style Synth plays chords in Poly; switch Voices to Mono for one-note legato and glide. \"Moog-style\" describes the kind of synth; this app has no connection with Moog Music.").color(MUTED).size(12.0));
                 ui.label(egui::RichText::new("Tips: drag or scroll a knob; Shift for fine; double-click to reset.").color(MUTED).size(12.0));
             });
         self.show_about = open;
@@ -1239,7 +1320,7 @@ fn value_text(p: &Params, t: Target) -> String {
         Target::Resonance => if v >= 0.97 { "self-osc".into() } else { format!("{:.0}%", v * 100.0) },
         Target::Glide => {
             let secs = grand_piano::synth::glide_secs(v);
-            if p.preset_of(InstrumentKind::MonoSynth) == 2 {
+            if p.voice_mode() == VoiceMode::Poly {
                 "mono only".into()
             } else if secs < 0.0005 {
                 "off".into()

@@ -61,6 +61,11 @@ pub struct Settings {
     pub strings_cutoff: f32,
     pub mono_resonance: f32,
     pub mono_glide: f32,
+    /// Moog-style synth Voices switch. Files from before it existed load as
+    /// Poly, whatever the preset (the Bass and Lead presets used to be mono-only).
+    pub mono_voices: crate::synth::VoiceMode,
+    /// note priority in Mono voice mode
+    pub mono_priority: crate::synth::NotePriority,
     /// mod wheel position for the synths (vibrato)
     pub synth_vibrato: f32,
     // ---- pitch bend: range in semitones per instrument (piano, mono, strings)
@@ -104,6 +109,8 @@ impl Default for Settings {
             strings_cutoff: crate::strings::STRING_PRESETS[0].cutoff,
             mono_resonance: crate::synth::MONO_PRESETS[0].resonance,
             mono_glide: crate::synth::MONO_PRESETS[0].glide,
+            mono_voices: crate::synth::VoiceMode::Poly,
+            mono_priority: crate::synth::NotePriority::Last,
             synth_vibrato: 0.0,
             bend_up: [crate::params::DEFAULT_BEND_RANGE; 3],
             bend_down: [crate::params::DEFAULT_BEND_RANGE; 3],
@@ -169,6 +176,8 @@ impl Settings {
         p.synth_cutoff[2].set(self.strings_cutoff.clamp(0.0, 1.0));
         p.resonance.set(self.mono_resonance.clamp(0.0, 1.0));
         p.glide.set(self.mono_glide.clamp(0.0, 1.0));
+        p.set_voice_mode(self.mono_voices);
+        p.set_note_priority(self.mono_priority);
         p.vibrato.set(self.synth_vibrato.clamp(0.0, 1.0));
         for i in 0..3 {
             p.bend_up[i].store(self.bend_up[i].min(crate::params::MAX_BEND_RANGE), Ordering::Relaxed);
@@ -202,6 +211,8 @@ impl Settings {
         self.strings_cutoff = p.synth_cutoff[2].get();
         self.mono_resonance = p.resonance.get();
         self.mono_glide = p.glide.get();
+        self.mono_voices = p.voice_mode();
+        self.mono_priority = p.note_priority();
         self.synth_vibrato = p.vibrato.get();
         for i in 0..3 {
             self.bend_up[i] = p.bend_up[i].load(Ordering::Relaxed);
@@ -241,6 +252,30 @@ mod tests {
         assert_eq!(partial.beats_per_bar, 4);
         assert_eq!(partial.bend_up, [2, 2, 2]);
         assert!(!partial.piano_bend);
+    }
+
+    #[test]
+    fn settings_from_before_the_voices_switch_load_as_poly() {
+        use crate::synth::{NotePriority, VoiceMode};
+        // a settings file from before the switch: Bass preset (mono-only then)
+        let old = r#"{"volume":0.8,"instrument":"MonoSynth","mono_preset":0,"mono_cutoff":0.36,"mono_glide":0.0}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.mono_voices, VoiceMode::Poly);
+        assert_eq!(s.mono_priority, NotePriority::Last);
+        let p = Params::default();
+        p.set_voice_mode(VoiceMode::Mono);
+        s.apply_to(&p, &Mapper::with_defaults());
+        assert_eq!(p.voice_mode(), VoiceMode::Poly);
+        assert_eq!(p.preset_of(InstrumentKind::MonoSynth), 0);
+        // and the new fields round-trip
+        p.set_voice_mode(VoiceMode::Mono);
+        p.set_note_priority(NotePriority::Low);
+        let mut t = s.clone();
+        t.capture(&p, &Mapper::with_defaults());
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(j.contains(r#""mono_voices":"Mono""#) && j.contains(r#""mono_priority":"Low""#), "{j}");
+        let u: Settings = serde_json::from_str(&j).unwrap();
+        assert_eq!((u.mono_voices, u.mono_priority), (VoiceMode::Mono, NotePriority::Low));
     }
 
     #[test]

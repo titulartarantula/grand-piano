@@ -135,7 +135,8 @@ impl Mapper {
             | Target::MetronomeStartStop
             | Target::TapTempo
             | Target::OctaveDown
-            | Target::OctaveUp => {
+            | Target::OctaveUp
+            | Target::Voices => {
                 // A button: each press (rising past the middle) acts once.
                 // Buttons send 127 on press and 0 on release.
                 if value == 127 && prev < 64 {
@@ -146,6 +147,7 @@ impl Mapper {
                         Target::MetronomeStartStop => params.toggle_metronome(),
                         Target::OctaveDown => params.step_octave(-1),
                         Target::OctaveUp => params.step_octave(1),
+                        Target::Voices => params.set_voice_mode(params.voice_mode().toggled()),
                         _ => params.tap(now_us()),
                     }
                 } else if value != 0 && value != 127 && t != Target::TapTempo {
@@ -250,6 +252,31 @@ mod tests {
         assert_eq!(p.synth_cutoff[1].get(), 1.0);
         assert!((p.vibrato.get() - 64.0 / 127.0).abs() < 1e-6);
         assert_eq!(p.tone.get(), crate::params::DEFAULT_TONE);
+    }
+
+    #[test]
+    fn voices_button_toggles_poly_and_mono() {
+        use crate::synth::VoiceMode;
+        let m = Mapper::with_defaults();
+        let p = Params::default();
+        assert_eq!(p.voice_mode(), VoiceMode::Poly);
+        m.start_learn(Target::Voices);
+        m.handle_cc(&p, 104, 127); // learning press does nothing else
+        m.handle_cc(&p, 104, 0);
+        assert_eq!(m.get(104), Some(Target::Voices));
+        assert_eq!(p.voice_mode(), VoiceMode::Poly);
+        m.handle_cc(&p, 104, 127);
+        m.handle_cc(&p, 104, 0);
+        assert_eq!(p.voice_mode(), VoiceMode::Mono);
+        m.handle_cc(&p, 104, 127);
+        m.handle_cc(&p, 104, 0);
+        assert_eq!(p.voice_mode(), VoiceMode::Poly);
+        // a fader picks directly
+        m.set(21, Some(Target::Voices));
+        m.handle_cc(&p, 21, 100);
+        assert_eq!(p.voice_mode(), VoiceMode::Mono);
+        m.handle_cc(&p, 21, 10);
+        assert_eq!(p.voice_mode(), VoiceMode::Poly);
     }
 
     #[test]
