@@ -92,6 +92,9 @@ impl App {
         let params = Arc::new(Params::default());
         let mapper = Arc::new(Mapper::default());
         settings.apply_to(&params, &mapper);
+        if shot.is_some() {
+            shot_overrides(&params);
+        }
         let sink = Arc::new(EventSink::default());
         let midi = Midi::new(params.clone(), mapper.clone(), sink.clone(), Some(ctx.clone()));
         let mut app = App {
@@ -200,15 +203,21 @@ impl App {
                     LoadMsg::Ready(inst) => {
                         self.instrument = Some(inst);
                         self.phase = Phase::Ready;
-                        self.devices = audio_win::list_output_devices().unwrap_or_default();
-                        self.start_audio();
+                        // a screenshot run leaves the audio device and MIDI port to
+                        // a copy of the app that may already be open
+                        if self.shot.is_none() {
+                            self.devices = audio_win::list_output_devices().unwrap_or_default();
+                            self.start_audio();
+                        }
                     }
                     LoadMsg::Failed(e) => self.phase = Phase::Failed(e),
                 }
             }
         }
-        let preferred = self.settings.midi_port.clone();
-        self.midi.poll(preferred.as_deref(), false);
+        if self.shot.is_none() {
+            let preferred = self.settings.midi_port.clone();
+            self.midi.poll(preferred.as_deref(), false);
+        }
         if let Some(a) = &self.audio {
             if a.failed.load(Ordering::Relaxed) {
                 self.audio_error = a.error.lock().unwrap().clone().or(Some("audio device stopped".into()));
@@ -499,12 +508,40 @@ impl App {
         // ---- row 1: instruments
         let h = 32.0;
         let y = r.min.y + 12.0;
+        // Equal gaps: each cell is its name's width plus the same padding, so the
+        // space between neighbouring names is the same all along the row. Every
+        // name uses one font size; if the window is too narrow for the full names
+        // at the smallest size, all of them switch to their short form.
         let n = InstrumentKind::ALL.len() as f32;
-        let seg = ((r.width() - 2.0 * pad - chip_w - 10.0) / n).min(132.0);
-        let total = Rect::from_min_size(pos2(r.min.x + pad, y), vec2(seg * n, h));
+        let avail = r.width() - 2.0 * pad - chip_w - 10.0;
+        let (min_pad, max_pad) = (18.0, 56.0);
+        let widths = |short: bool, size: f32| -> Vec<f32> {
+            InstrumentKind::ALL
+                .iter()
+                .map(|k| p.layout_no_wrap((if short { short_label(*k) } else { k.label() }).to_string(), FontId::proportional(size), TEXT).size().x)
+                .collect()
+        };
+        let fits = |w: &[f32]| w.iter().sum::<f32>() + n * min_pad <= avail;
+        let (mut short, mut size) = (false, 13.5);
+        let mut text_w = widths(short, size);
+        while !fits(&text_w) {
+            if size > 10.5 {
+                size -= 0.5;
+            } else if !short {
+                (short, size) = (true, 13.5);
+            } else {
+                break;
+            }
+            text_w = widths(short, size);
+        }
+        let cell_pad = ((avail - text_w.iter().sum::<f32>()) / n).clamp(min_pad, max_pad);
+        let row_w = text_w.iter().sum::<f32>() + n * cell_pad;
+        let total = Rect::from_min_size(pos2(r.min.x + pad, y), vec2(row_w, h));
         p.rect_filled(total, CornerRadius::same(16), RAISED);
+        let mut x = total.min.x;
         for (i, k) in InstrumentKind::ALL.iter().enumerate() {
-            let sr = Rect::from_min_size(pos2(total.min.x + seg * i as f32, total.min.y), vec2(seg, h));
+            let sr = Rect::from_min_size(pos2(x, total.min.y), vec2(text_w[i] + cell_pad, h));
+            x = sr.max.x;
             let resp = ui.interact(sr, ui.make_persistent_id(("inst", i)), Sense::click());
             let sel = *k == cur;
             if sel {
@@ -512,9 +549,7 @@ impl App {
             } else if resp.hovered() {
                 p.rect_filled(sr.shrink(3.0), CornerRadius::same(13), LINE);
             }
-            // narrow window: a short name if the full one doesn't fit
-            let name = if p.layout_no_wrap(k.label().to_string(), FontId::proportional(10.5), TEXT).size().x > seg - 10.0 { short_label(*k) } else { k.label() };
-            let size = fit_size(&p, name, 13.5, 10.5, seg - 10.0);
+            let name = if short { short_label(*k) } else { k.label() };
             p.text(sr.center(), Align2::CENTER_CENTER, name, FontId::proportional(size), if sel { BG } else { TEXT });
             if resp.clicked() {
                 self.params.set_instrument(*k);
@@ -944,12 +979,16 @@ impl App {
         let radius = if compact {
             ((area.height() - 70.0) / 2.0 - 10.0).min(area.width() * 0.3).clamp(18.0, 40.0)
         } else {
-            ((area.height() - 106.0) / 2.0).min(area.width() * 0.26).clamp(22.0, 58.0)
+            // 112: label, arc, value and chip, plus a gap above the VELOCITY heading
+            ((area.height() - 112.0) / 2.0).min(area.width() * 0.26).clamp(22.0, 58.0)
         };
-        let center = if compact { pos2(area.center().x, area.min.y + 22.0 + radius + 10.0) } else { pos2(area.center().x, area.min.y + 34.0 + radius + 8.0) };
+        let center = if compact { pos2(area.center().x, area.min.y + 28.0 + radius + 10.0) } else { pos2(area.center().x, area.min.y + 34.0 + radius + 8.0) };
         let p = ui.painter().clone();
         let label_size = (area.width() / 10.0).clamp(8.5, 11.5);
-        spaced(&p, pos2(center.x, if compact { area.min.y + 10.0 } else { area.min.y + 26.0 }), label, label_size, MUTED, Align2::CENTER_CENTER);
+        // the label sits clear above the value arc (whose top is 10 px above the
+        // knob), so the arc never runs through it, even at full
+        let ring_top = center.y - radius - 10.0 - 2.0;
+        spaced(&p, pos2(center.x, ring_top - 12.0 - label_size * 0.5), label, label_size, MUTED, Align2::CENTER_CENTER);
         let hit = Rect::from_center_size(center, Vec2::splat(radius * 2.3));
         let resp = ui.interact(hit, ui.make_persistent_id(("knob", t.id())), Sense::click_and_drag());
         let mut v = self.params.get_target(t);
@@ -1557,6 +1596,21 @@ fn fit_size(p: &egui::Painter, text: &str, max: f32, min: f32, width: f32) -> f3
         size -= 0.5;
     }
     size
+}
+
+/// `--screenshot` extras for checking the layout: `--instrument N` (0..5, in
+/// selector order) and `--knobs V` (0..1, every knob on that instrument plus tempo).
+fn shot_overrides(params: &Params) {
+    let args: Vec<String> = std::env::args().collect();
+    let after = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    if let Some(i) = after("--instrument").and_then(|s| s.parse::<u8>().ok()) {
+        params.set_instrument(InstrumentKind::from_id(i));
+    }
+    if let Some(v) = after("--knobs").and_then(|s| s.parse::<f32>().ok()) {
+        for t in [Target::Volume, Target::Tone, Target::Resonance, Target::Glide, Target::Reverb, Target::Modulation, Target::Touch, Target::Tempo] {
+            params.set_target(t, v);
+        }
+    }
 }
 
 fn short_label(k: InstrumentKind) -> &'static str {

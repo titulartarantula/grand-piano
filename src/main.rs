@@ -23,8 +23,10 @@ fn main() {
     let data = grand_piano::settings::data_dir();
     let _ = std::fs::create_dir_all(&data);
 
-    // log to %LOCALAPPDATA%\GrandPiano\grandpiano.log
-    if let Ok(file) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(data.join("grandpiano.log")) {
+    // log to %LOCALAPPDATA%\GrandPiano\grandpiano.log (a --screenshot run logs to
+    // %TEMP% instead, so it doesn't wipe the log of a copy that's already open)
+    let log_path = if has("--screenshot") { std::env::temp_dir().join("grandpiano-screenshot.log") } else { data.join("grandpiano.log") };
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_path) {
         env_logger::Builder::new()
             .filter_level(log::LevelFilter::Info)
             .target(env_logger::Target::Pipe(Box::new(file)))
@@ -45,14 +47,18 @@ fn main() {
     }
 
     // --screenshot OUT.png: start normally, wait until the piano has loaded, save a
-    // picture of the window and quit (used for the README). It opens at the default
-    // size and doesn't save settings or the window position.
+    // picture of the window and quit (used for the README). It renders at the default
+    // size without showing the window, doesn't open audio or MIDI, and doesn't save
+    // settings or the window position. --instrument N and --knobs V (0..1) pick what
+    // it shows.
     let shot = arg_after("--screenshot").map(std::path::PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Grand Piano")
             .with_inner_size([1180.0, 700.0])
             .with_min_inner_size([960.0, 620.0])
+            // a screenshot run paints off screen (see ui::App::screenshot_step)
+            .with_visible(shot.is_none())
             .with_icon(std::sync::Arc::new(ui::icon())),
         persist_window: shot.is_none(),
         persistence_path: Some(match shot {
